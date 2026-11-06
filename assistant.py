@@ -2634,14 +2634,22 @@ def run_daemon(
         try:
             old_pid = int(pid_file.read_text(encoding="utf-8").strip())
             if old_pid != os.getpid():
-                # Prüfen ob Prozess noch läuft (Windows tasklist)
-                proc = subprocess.run(
-                    ["tasklist", "/FI", f"PID eq {old_pid}", "/NH"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-                if str(old_pid) in proc.stdout and ("python" in proc.stdout.lower()):
+                is_running = False
+                if sys.platform == "win32":
+                    proc = subprocess.run(
+                        ["tasklist", "/FI", f"PID eq {old_pid}", "/NH"],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    is_running = str(old_pid) in proc.stdout and ("python" in proc.stdout.lower())
+                else:
+                    try:
+                        os.kill(old_pid, 0)
+                        is_running = True
+                    except OSError:
+                        is_running = False
+                if is_running:
                     print(f"[Daemon] Läuft bereits unter PID {old_pid}. Beende Duplikat.")
                     return
         except Exception:
