@@ -1559,6 +1559,83 @@ def find_matching_task(query: str, tasks: list[dict[str, Any]]) -> dict[str, Any
     return best_t
 
 
+def parse_task_indices(text: str, max_idx: int) -> list[int]:
+    """Extrahiert 1-basierte Aufgaben-Indizes aus Strings wie '1, 3, 5', '1-3', '1 und 4'."""
+    if not text or max_idx <= 0:
+        return []
+    indices: set[int] = set()
+
+    # 1. Bereiche: z. B. 1-3 oder 1 bis 3
+    for match in re.finditer(r"\b(\d+)\s*(?:-|bis)\s*(\d+)\b", text, flags=re.IGNORECASE):
+        start, end = int(match.group(1)), int(match.group(2))
+        if start > end:
+            start, end = end, start
+        for i in range(start, end + 1):
+            if 1 <= i <= max_idx:
+                indices.add(i)
+
+    # 2. Einzelne Nummern: z. B. 1, 3, 4
+    cleaned = re.sub(r"\b\d+\s*(?:-|bis)\s*\d+\b", " ", text, flags=re.IGNORECASE)
+    for num_str in re.findall(r"\b\d+\b", cleaned):
+        val = int(num_str)
+        if 1 <= val <= max_idx:
+            indices.add(val)
+
+    return sorted(indices)
+
+
+def resolve_tasks_to_complete(
+    text: str, open_todos: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Löst Benutzereingaben (mehrere Nummern, Bereiche, Namen oder Freitext) in Aufgaben auf."""
+    if not text or not open_todos:
+        return []
+
+    # 1. Nummern oder Bereiche (z. B. '1, 3', '1-3', '1 und 4')
+    indices = parse_task_indices(text, len(open_todos))
+    if indices:
+        return [open_todos[i - 1] for i in indices]
+
+    # 2. Bereinigung für Textsuche
+    clean = re.sub(
+        r"^(/erledigt|/done|erledigt:?|abgehakt:?|fertig:?)\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+    clean = re.sub(
+        r"\b(habe|hab|ich habe|bitte|als erledigt markieren|erledigt|abgehakt|fertig|schon)\b",
+        "",
+        clean,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    matched: list[dict[str, Any]] = []
+    matched_ids: set[str] = set()
+
+    # Nach Komma oder 'und' aufteilen
+    sub_queries = [p.strip() for p in re.split(r",|\bund\b", clean, flags=re.IGNORECASE) if p.strip()]
+    if not sub_queries:
+        sub_queries = [clean] if clean else []
+
+    for q in sub_queries:
+        if len(q) < 2:
+            continue
+        t = find_matching_task(q, open_todos)
+        if t:
+            tid = str(t.get("notion_page_id") or t.get("title"))
+            if tid not in matched_ids:
+                matched.append(t)
+                matched_ids.add(tid)
+
+    if not matched and clean:
+        t = find_matching_task(clean, open_todos)
+        if t:
+            matched.append(t)
+
+    return matched
+
+
 def answer_question(
     question: str,
     state: dict[str, Any],
@@ -1690,8 +1767,9 @@ Gib ein JSON-Objekt zurück mit genau dieser Struktur:
   "correction_details": "Kurze Zusammenfassung was korrigiert werden soll oder null"
 }}"""
 
+    fast_model = model_override or cfg.get("llm", {}).get("fast_model", "gemini-3.5-flash-lite")
     try:
-        return call_llm_json(prompt, cfg, model_override=model_override)
+        return call_llm_json(prompt, cfg, model_override=fast_model)
     except Exception as exc:
         print(f"[Intent Router Fallback] {exc}")
         if is_question_message(text):
@@ -1816,7 +1894,7 @@ def process_telegram_updates(
                 "• `/kalender` – Terminvorschau (7 Tage)\n"
                 "• `/todos` – Offene Aufgabenliste\n"
                 "• `/ideen` – Proaktive Vorschläge\n"
-                "• `/erledigt <Nr>` – Aufgabe direkt per Nummer abhaken\n"
+                "• `/erledigt <Nr/Name>` – Aufgabe(n) abhaken (z. B. `/erledigt 1, 3` oder `/erledigt 1-3`)\n"
                 "• `/suche <Text>` – Notion durchsuchen\n"
                 "• `/themen` – RSS-Themengebiete verwalten (/themen an|aus|neu|run)\n"
                 "• `/update` – Neuesten Code von GitHub laden & Assistenten neu starten",
@@ -1873,7 +1951,7 @@ def process_telegram_updates(
                 for i, t in enumerate(open_todos, 1):
                     due = f" [Fällig: {t['due_date']}]" if t.get("due_date") else ""
                     lines.append(f"{i}. [{t.get('priority', 'Mittel')}]{due} **{t.get('title')}**")
-                lines.append("\nZum Abhaken einfach `/erledigt <Nummer>` senden oder per Sprache mitteilen!")
+                lines.append("\nZum Abhaken: `/erledigt 1, 3` (mehrere), `/erledigt 1-3` (Bereich) oder per Name/Sprache!")
                 _send_telegram_message(api_base, chat_id, "\n".join(lines))
             continue
 
@@ -1907,23 +1985,59 @@ def process_telegram_updates(
 
         if cmd_lower.startswith(("/erledigt", "/done")):
             parts = raw_text.split(maxsplit=1)
+            arg = parts[1].strip() if len(parts) > 1 else ""
             open_todos = [t for t in state.get("tasks", []) if t.get("kind") == "To-Do" and t.get("status") != "Erledigt"]
-            if len(parts) > 1 and parts[1].strip().isdigit():
-                idx = int(parts[1].strip()) - 1
-                if 0 <= idx < len(open_todos):
-                    target_task = open_todos[idx]
-                    target_task["status"] = "Erledigt"
-                    n_page_id = target_task.get("notion_page_id")
+            if not open_todos:
+                _send_telegram_message(api_base, chat_id, "✅ Du hast aktuell keine offenen To-Dos!")
+                continue
+
+            if not arg:
+                _send_telegram_message(
+                    api_base,
+                    chat_id,
+                    "ℹ️ Bitte Nummer(n) oder Name(n) angeben, z. B.:\n"
+                    "• `/erledigt 1, 3` (mehrere auf einmal)\n"
+                    "• `/erledigt 1-3` (Bereich von 1 bis 3)\n"
+                    "• `/erledigt Video schneiden` (nach Name/Stichwort)\n\n"
+                    "📋 Liste deiner Aufgaben anzeigen: `/todos`",
+                )
+                continue
+
+            target_tasks = resolve_tasks_to_complete(arg, open_todos)
+            if target_tasks:
+                for t in target_tasks:
+                    t["status"] = "Erledigt"
+                    n_page_id = t.get("notion_page_id")
                     if notion and n_page_id:
                         try:
                             notion.mark_task_done(n_page_id)
-                        except Exception:
-                            pass
-                    _send_telegram_message(api_base, chat_id, f"✅ Als erledigt markiert:\n• **{target_task.get('title')}**")
-                    count += 1
-                    continue
-            _send_telegram_message(api_base, chat_id, "Bitte Nummer angeben, z. B. `/erledigt 1` (Liste mit `/todos`).")
-            continue
+                        except Exception as _e:
+                            print(f"[Notion Task Error] {_e}")
+                save_local_state(state_path, state)
+
+                if len(target_tasks) == 1:
+                    resp = f"✅ Als erledigt markiert:\n• **{target_tasks[0].get('title')}**"
+                else:
+                    titles = "\n".join(f"• **{t.get('title')}**" for t in target_tasks)
+                    resp = f"✅ **{len(target_tasks)} Aufgaben als erledigt markiert:**\n{titles}"
+
+                remaining = [t for t in open_todos if t not in target_tasks]
+                if remaining:
+                    resp += f"\n\n📋 Noch *{len(remaining)} offene Aufgabe(n)* (Liste mit `/todos`)."
+                else:
+                    resp += "\n\n🎉 *Alle offenen To-Dos erledigt!*"
+
+                _send_telegram_message(api_base, chat_id, resp)
+                count += 1
+                continue
+            else:
+                _send_telegram_message(
+                    api_base,
+                    chat_id,
+                    f"⚠️ Konnte keine passende offene Aufgabe zu „{arg}“ finden.\n"
+                    f"Nutze `/todos` für die aktuelle Nummernliste.",
+                )
+                continue
 
         if cmd_lower.startswith(("/suche", "/search")):
             parts = raw_text.split(maxsplit=1)
@@ -2286,21 +2400,35 @@ WICHTIG: Erstelle daraus KEINE neue Aufgabe in Notion Tasks."""
         if intent == "COMPLETE_TASK":
             task_title_q = intent_info.get("task_title") or raw_text
             open_todos = [t for t in state.get("tasks", []) if t.get("kind") == "To-Do" and t.get("status") != "Erledigt"]
-            best_t = find_matching_task(task_title_q, open_todos)
+            
+            target_tasks = resolve_tasks_to_complete(raw_text, open_todos)
+            if not target_tasks and task_title_q != raw_text:
+                target_tasks = resolve_tasks_to_complete(task_title_q, open_todos)
 
-            if best_t:
-                best_t["status"] = "Erledigt"
-                n_id = best_t.get("notion_page_id")
-                if notion and n_id:
-                    try:
-                        notion.mark_task_done(n_id)
-                    except Exception:
-                        pass
-                _send_telegram_message(
-                    api_base,
-                    chat_id,
-                    f"✅ In Notion & lokal als erledigt markiert:\n• **{best_t.get('title')}**",
-                )
+            if target_tasks:
+                for t in target_tasks:
+                    t["status"] = "Erledigt"
+                    n_id = t.get("notion_page_id")
+                    if notion and n_id:
+                        try:
+                            notion.mark_task_done(n_id)
+                        except Exception as _e:
+                            print(f"[Notion Task Error] {_e}")
+                save_local_state(state_path, state)
+
+                if len(target_tasks) == 1:
+                    resp = f"✅ In Notion & lokal als erledigt markiert:\n• **{target_tasks[0].get('title')}**"
+                else:
+                    titles = "\n".join(f"• **{t.get('title')}**" for t in target_tasks)
+                    resp = f"✅ In Notion & lokal als erledigt markiert ({len(target_tasks)} Aufgaben):\n{titles}"
+
+                remaining = [t for t in open_todos if t not in target_tasks]
+                if remaining:
+                    resp += f"\n\n📋 Noch *{len(remaining)} offene Aufgabe(n)* (Übersicht mit `/todos`)."
+                else:
+                    resp += "\n\n🎉 *Alle offenen To-Dos erledigt!*"
+
+                _send_telegram_message(api_base, chat_id, resp)
                 count += 1
                 continue
             else:
@@ -2616,7 +2744,7 @@ def generate_briefing(
             lines.append(f"  • **{s.get('title')}**{step}")
 
     if mode == "evening" and open_todos:
-        lines.append("\nTipp: Antworte direkt hier im Chat mit `/erledigt <Nummer>`, um erledigte Aufgaben abzuhaken!")
+        lines.append("\nTipp: Antworte direkt hier im Chat mit `/erledigt 1, 3` oder `/erledigt <Name>`, um Aufgaben abzuhaken!")
 
     text = "\n".join(lines)
     if notify and (open_todos or suggestions or all_cal):
