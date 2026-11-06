@@ -1818,7 +1818,8 @@ def process_telegram_updates(
                 "• `/ideen` – Proaktive Vorschläge\n"
                 "• `/erledigt <Nr>` – Aufgabe direkt per Nummer abhaken\n"
                 "• `/suche <Text>` – Notion durchsuchen\n"
-                "• `/themen` – RSS-Themengebiete verwalten (/themen an|aus|neu|run)",
+                "• `/themen` – RSS-Themengebiete verwalten (/themen an|aus|neu|run)\n"
+                "• `/update` – Neuesten Code von GitHub laden & Assistenten neu starten",
             )
             continue
 
@@ -1948,6 +1949,14 @@ def process_telegram_updates(
             if not notion_results and not matching_notes:
                 lines.append("Keine Treffer in Notion oder Notizen gefunden.")
             _send_telegram_message(api_base, chat_id, "\n".join(lines))
+            continue
+
+        if cmd_lower in ("/update", "/upgrade", "update", "/pull"):
+            _send_telegram_message(api_base, chat_id, "⏳ Prüfe GitHub auf Updates...")
+            needs_restart, update_msg = perform_self_update()
+            _send_telegram_message(api_base, chat_id, update_msg)
+            if needs_restart:
+                trigger_restart()
             continue
 
         if cmd_lower in ("/run", "/sync", "run", "sync") or cmd_lower.startswith(("/run ", "/sync ")):
@@ -2628,6 +2637,83 @@ def generate_briefing(
             print("[Telegram] Hinweis: Für Telegram-Push bitte TELEGRAM_BOT_TOKEN in .env setzen und dem Bot einmal /start schreiben.")
 
     return text
+
+
+def perform_self_update() -> tuple[bool, str]:
+    """Führt ein git pull aus und aktualisiert ggf. Abhängigkeiten.
+    Gibt (needs_restart, message) zurück.
+    """
+    import subprocess
+    try:
+        pull_proc = subprocess.run(
+            ["git", "pull"],
+            cwd=BASE_DIR,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if pull_proc.returncode != 0:
+            err = pull_proc.stderr.strip() or pull_proc.stdout.strip()
+            return False, f"❌ `git pull` fehlgeschlagen:\n```\n{err}\n```"
+
+        pull_out = pull_proc.stdout.strip()
+        already_up_to_date = "Already up to date" in pull_out or "Bereits aktuell" in pull_out
+
+        log_proc = subprocess.run(
+            ["git", "log", "-1", "--format=%h - %s (%cr)"],
+            cwd=BASE_DIR,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        commit_info = log_proc.stdout.strip() if log_proc.returncode == 0 else ""
+
+        if already_up_to_date:
+            return False, f"✅ Das System ist bereits auf dem neuesten Stand!\n\n📌 Aktueller Commit:\n`{commit_info}`"
+
+        pip_note = ""
+        if "requirements.txt" in pull_out:
+            pip_proc = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-r", "requirements.txt", "-q"],
+                cwd=BASE_DIR,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if pip_proc.returncode == 0:
+                pip_note = "\n📦 Neue Python-Pakete wurden installiert."
+            else:
+                pip_note = f"\n⚠️ Warnung bei pip install: {pip_proc.stderr[:120]}"
+
+        msg = (
+            f"🔄 *Update erfolgreich heruntergeladen!*\n\n"
+            f"📌 *Neuer Commit:*\n`{commit_info}`\n"
+            f"{pip_note}\n\n"
+            f"⚡ Starte Dienst jetzt neu..."
+        )
+        return True, msg
+    except Exception as exc:
+        return False, f"❌ Fehler beim Aktualisieren: {exc}"
+
+
+def trigger_restart() -> None:
+    """Startet den Prozess sauber neu.
+    Funktioniert unter systemd (Restart=always) und direkt via os.execv / sys.exit.
+    """
+    import threading
+    def _restart():
+        time.sleep(1.5)
+        pid_file = BASE_DIR / "daemon.pid"
+        try:
+            pid_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except Exception:
+            os._exit(0)
+
+    threading.Thread(target=_restart, daemon=True).start()
 
 
 def run_daemon(

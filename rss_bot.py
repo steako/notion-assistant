@@ -219,7 +219,8 @@ def handle_start_or_help(chat_id: str) -> str:
         "• `/covid` – Aktuelle Infektionsschätzung von @rv-enigma\n"
         "• `/deals` – Aktuelle Rabattaktionen für Studenten/Dozenten\n"
         "• `/suche <Begriff>` – Notion-Wissensspeicher durchsuchen\n"
-        "• `/status` – Systemstatus, Eintragszahl & nächste Termine\n\n"
+        "• `/status` – Systemstatus, Eintragszahl & nächste Termine\n"
+        "• `/update` – Neuesten Code von GitHub laden & Bot neu starten\n\n"
         "💡 _Tipp: Du kannst mir auch einfach Fragen zu den Themen stellen "
         "oder Sprachnachrichten senden!_"
     )
@@ -575,6 +576,15 @@ def process_updates(token: str, state: dict[str, Any], poll_timeout: int = 15) -
                 send_message(token, chat_id, handle_suche(chat_id, arg))
             elif cmd in ("/status", "status"):
                 send_message(token, chat_id, handle_status(chat_id))
+            elif cmd in ("/update", "/upgrade", "update", "/pull"):
+                send_message(token, chat_id, "⏳ Prüfe GitHub auf Updates...")
+                if assistant is not None:
+                    needs_restart, update_msg = assistant.perform_self_update()
+                    send_message(token, chat_id, update_msg)
+                    if needs_restart:
+                        assistant.trigger_restart()
+                else:
+                    send_message(token, chat_id, "❌ Fehler: assistant-Modul nicht geladen.")
             else:
                 handle_natural_language(chat_id, raw_text, token)
         except Exception as exc:
