@@ -1,0 +1,51 @@
+{
+  "notion": {
+    "workspace_id": "b2428f20-9755-8153-a67b-0003f1666cfa",
+    "cockpit_page_id": "40928f20-9755-8135-9a5d-ca0ea5754723",
+    "agent_operating_guide_id": "40928f20-9755-81fc-8766-eae50d15a250",
+    "inbox_database_id": "4269a0f6-fa41-495a-96fb-82417d95762d",
+    "inbox_data_source_id": "5d76c47a-6005-42d6-98ba-da79c1312465",
+    "tasks_database_id": "f0e562e1-c132-4989-a7d7-96ad5e8adc02",
+    "tasks_data_source_id": "1afde2c9-c340-420c-aacc-825ea8791ac3",
+    "documents_database_id": "992d2210-6628-493d-90b0-bff21d75e0fa",
+    "memories_database_id": "40928f20-9755-81fb-b16d-f5679e2942f3",
+    "knowledge_hub_page_id": "40f28f20-9755-8173-a9fb-c186ba992316",
+    "knowledge_database_id": "c7bac0f9-b222-4aa6-a0b4-2510fb987b7b"
+  },
+  "llm": {
+    "provider": "gemini",
+    "model": "gemini-3.8-flash",
+    "fallback_provider": "ollama"
+  },
+  "transcription": {
+    "provider": "gemini",
+    "fallback_provider": "whisper"
+  },
+  "ollama": {
+    "base_url": "http://localhost:11434",
+    "model": "devstral:24b",
+    "fallback_models": [
+      "qwen3-coder:30b",
+      "qwen2.5:7b"
+    ]
+  },
+  "whisper": {
+    "model_size": "small",
+    "language": "de",
+    "device": "auto"
+  },
+  "email": {
+    "enabled": false,
+    "provider": "imap",
+    "server": "imap.gmail.com",
+    "port": 993,
+    "label": "Assistent",
+    "only_starred": false,
+    "max_emails": 5
+  },
+  "paths": {
+    "inbox_drop_dir": "inbox_drop",
+    "processed_dir": "inbox_drop/processed",
+    "local_state_file": "local_state.json"
+  }
+}

@@ -1,0 +1,35 @@
+# Environment & Secrets (Kritisch für Privatsphäre!)
+.env
+.env.local
+.env.*.local
+
+# Lokale Zustände, Caches & Logs (enthalten persönliche Daten/Kalendereinträge)
+*.log
+*.pid
+*.lock
+local_state.json
+rss_state.json
+gcal_cache.json
+
+# Audio- und Notiz-Drops von unterwegs
+inbox_drop/*
+!inbox_drop/.gitkeep
+inbox_drop/processed/*
+calendar_outbox/*
+!calendar_outbox/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+env/
+venv/
+ENV/
+
+# Betriebssystem & temporäre Dateien
+Thumbs.db
+[Dd]esktop.ini
+.DS_Store
+Textdokument (neu).txt

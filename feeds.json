@@ -1,0 +1,293 @@
+{
+  "settings": {
+    "max_age_days": 10,
+    "max_items_per_source": 25,
+    "max_candidates_per_llm_call": 35,
+    "known_context_items": 150,
+    "min_relevance": "Mittel",
+    "seen_retention_days": 180,
+    "create_digest_page": true,
+    "notify_telegram": true,
+    "notify_windows": true
+  },
+  "notion": {
+    "hub_page_id": "40f28f20-9755-8173-a9fb-c186ba992316",
+    "knowledge_database_id": "c7bac0f9-b222-4aa6-a0b4-2510fb987b7b",
+    "knowledge_data_source_id": "cd783ca0-52ae-4563-9865-4333284f44f2"
+  },
+  "topics": [
+    {
+      "id": "parkinson",
+      "name": "Parkinson",
+      "emoji": "🧠",
+      "enabled": true,
+      "focus": "Morbus Parkinson: wichtige neue Studien (v. a. randomisierte kontrollierte Studien, Phase-2/3-Ergebnisse, große Kohorten, Meta-Analysen, Studien in Top-Journals), echte Durchbrüche (Diagnostik/Biomarker wie alpha-Synuclein-Seed-Assays, krankheitsmodifizierende Ansätze, Zell- und Gentherapie) sowie neue oder neu zugelassene Behandlungen (Medikamente, tiefe Hirnstimulation, Geräte, Zulassungen durch FDA/EMA/G-BA). Nicht melden: reine Lifestyle-Ratgeber, Spendenaufrufe, Promi-Meldungen ohne neue Fakten, kleine Pilotstudien ohne klare Bedeutung, Tierstudien nur wenn außergewöhnlich bedeutsam.",
+      "categories": [
+        "Studie",
+        "Klinische Studie",
+        "Durchbruch",
+        "Behandlung/Therapie",
+        "Zulassung",
+        "Leitlinie/Politik",
+        "Sonstiges"
+      ],
+      "sources": [
+        {
+          "type": "rss",
+          "name": "Google News (EN)",
+          "url": "https://news.google.com/rss/search?q=Parkinson%27s+(study+OR+trial+OR+breakthrough+OR+treatment+OR+FDA)+when:3d&hl=en-US&gl=US&ceid=US:en"
+        },
+        {
+          "type": "rss",
+          "name": "Google News (DE)",
+          "url": "https://news.google.com/rss/search?q=Parkinson+(Studie+OR+Therapie+OR+Durchbruch+OR+Zulassung)+when:3d&hl=de&gl=DE&ceid=DE:de"
+        },
+        {
+          "type": "rss",
+          "name": "Medical Xpress",
+          "url": "https://medicalxpress.com/rss-feed/search/?search=parkinson"
+        },
+        {
+          "type": "rss",
+          "name": "Nature – Parkinson's disease",
+          "url": "https://www.nature.com/subjects/parkinsons-disease.rss"
+        },
+        {
+          "type": "rss",
+          "name": "medRxiv Neurology",
+          "url": "https://connect.medrxiv.org/medrxiv_xml.php?subject=Neurology",
+          "keywords": [
+            "parkinson"
+          ]
+        },
+        {
+          "type": "europepmc",
+          "name": "Europe PMC (RCTs, Phase-Studien, Meta-Analysen)",
+          "query": "TITLE:(parkinson*) AND (PUB_TYPE:\"Randomized Controlled Trial\" OR PUB_TYPE:\"Clinical Trial, Phase II\" OR PUB_TYPE:\"Clinical Trial, Phase III\" OR PUB_TYPE:\"Meta-Analysis\")"
+        },
+        {
+          "type": "atproto",
+          "name": "Bluesky (Parkinson Forschung & News)",
+          "queries": [
+            "parkinson study",
+            "parkinson studie",
+            "parkinson breakthrough",
+            "parkinson treatment",
+            "parkinson zulassung"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "long_covid",
+      "name": "Long COVID",
+      "emoji": "🫁",
+      "enabled": true,
+      "focus": "Long COVID / Post-COVID-Syndrom / PASC: wichtige neue Studien (RCTs, große Kohorten, Mechanismen wie Viruspersistenz, Mikrogerinnsel, Autoimmunität, Immun-Dysregulation), Durchbrüche bei Biomarkern und Diagnostik, neue oder erfolgversprechende Behandlungen (z. B. antivirale Therapien, Immunadsorption, Off-Label-Medikamente mit belastbaren Daten), Zulassungen sowie relevante Gesundheitspolitik/Versorgung. SONDERFALL COVID-INFEKTIONSLAGE (@rv-enigma): Erfasse jeden neuen Bericht, der die aktuellen Infektionsschätzungen ('Infiziert: 1 von xyz', R-Wert, Inzidenz) enthält, als Kategorie 'Infektionslage' (Relevanz: Mittel oder Hoch). Fasse die Kennzahlen (Infektionsquote '1 von ...', R-Wert, 7-Tages-Inzidenz) präzise im Titel und Text zusammen (z. B. 'Covid-19 Lage am [Datum]: Infiziert 1 von [Zahl] (R=[Wert])'). Ignoriere allgemeine Impfdebatten, politische Posts oder persönliche Meinungen ohne Zahlen.",
+      "categories": [
+        "Studie",
+        "Klinische Studie",
+        "Durchbruch",
+        "Behandlung/Therapie",
+        "Zulassung",
+        "Leitlinie/Politik",
+        "Infektionslage",
+        "Sonstiges"
+      ],
+      "sources": [
+        {
+          "type": "rss",
+          "name": "RV-Enigma (Bluesky: Covid-Zahlen)",
+          "url": "https://bsky.app/profile/did:plc:tlt75qtm4l5ivg47ho27qxbk/rss",
+          "keywords": [
+            "1 von",
+            "einer von"
+          ]
+        },
+        {
+          "type": "rss",
+          "name": "Google News (EN)",
+          "url": "https://news.google.com/rss/search?q=%22long+covid%22+(study+OR+trial+OR+treatment+OR+breakthrough)+when:3d&hl=en-US&gl=US&ceid=US:en"
+        },
+        {
+          "type": "rss",
+          "name": "Google News (DE)",
+          "url": "https://news.google.com/rss/search?q=(%22Long+COVID%22+OR+%22Post-COVID%22)+(Studie+OR+Therapie+OR+Behandlung)+when:3d&hl=de&gl=DE&ceid=DE:de"
+        },
+        {
+          "type": "rss",
+          "name": "Medical Xpress",
+          "url": "https://medicalxpress.com/rss-feed/search/?search=long+covid"
+        },
+        {
+          "type": "europepmc",
+          "name": "Europe PMC (Studien)",
+          "query": "TITLE:(\"long covid\" OR \"post-covid\" OR \"post-acute sequelae\" OR PASC) AND (PUB_TYPE:\"Randomized Controlled Trial\" OR PUB_TYPE:\"Clinical Trial\" OR PUB_TYPE:\"Meta-Analysis\" OR PUB_TYPE:\"Systematic Review\" OR JOURNAL:(\"Nature\" OR \"Nature Medicine\" OR \"Lancet\" OR \"Science\" OR \"N Engl J Med\" OR \"JAMA\" OR \"BMJ\"))"
+        },
+        {
+          "type": "atproto",
+          "name": "Bluesky (Long COVID Forschung & News)",
+          "queries": [
+            "long covid study",
+            "long covid studie",
+            "post covid forschung",
+            "long covid treatment",
+            "long covid biomarker"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "mecfs",
+      "name": "ME/CFS",
+      "emoji": "🔋",
+      "enabled": true,
+      "focus": "ME/CFS (Myalgische Enzephalomyelitis / Chronisches Fatigue-Syndrom): wichtige neue Studien (Biomarker, Pathomechanismen, Genetik wie DecodeME, RCTs), Durchbrüche, neue oder erfolgversprechende Behandlungen (z. B. Immunadsorption, BC007, Rituximab-Nachfolger, Off-Label-Therapien mit belastbaren Daten), Zulassungen sowie relevante Gesundheitspolitik/Versorgung/Forschungsförderung (insbesondere Deutschland/EU). Nicht melden: Kunst-/Kulturbeiträge, reine Erfahrungsberichte, Spendenaktionen ohne Forschungsbezug, Vereinsinterna.",
+      "categories": [
+        "Studie",
+        "Klinische Studie",
+        "Durchbruch",
+        "Behandlung/Therapie",
+        "Zulassung",
+        "Leitlinie/Politik",
+        "Sonstiges"
+      ],
+      "sources": [
+        {
+          "type": "rss",
+          "name": "Google News (EN)",
+          "url": "https://news.google.com/rss/search?q=(%22ME/CFS%22+OR+%22chronic+fatigue+syndrome%22+OR+%22myalgic+encephalomyelitis%22)+when:7d&hl=en-US&gl=US&ceid=US:en"
+        },
+        {
+          "type": "rss",
+          "name": "Google News (DE)",
+          "url": "https://news.google.com/rss/search?q=%22ME/CFS%22+when:7d&hl=de&gl=DE&ceid=DE:de"
+        },
+        {
+          "type": "rss",
+          "name": "Solve M.E.",
+          "url": "https://solvecfs.org/feed/"
+        },
+        {
+          "type": "rss",
+          "name": "ME Research UK",
+          "url": "https://www.meresearch.org.uk/feed/"
+        },
+        {
+          "type": "rss",
+          "name": "Deutsche Gesellschaft für ME/CFS",
+          "url": "https://www.mecfs.de/feed/"
+        },
+        {
+          "type": "rss",
+          "name": "Health Rising",
+          "url": "https://www.healthrising.org/feed/"
+        },
+        {
+          "type": "rss",
+          "name": "Medical Xpress",
+          "url": "https://medicalxpress.com/rss-feed/search/?search=chronic+fatigue"
+        },
+        {
+          "type": "europepmc",
+          "name": "Europe PMC (Forschung)",
+          "query": "(TITLE:(\"ME/CFS\" OR \"myalgic encephalomyelitis\" OR \"chronic fatigue syndrome\")) AND (PUB_TYPE:\"Journal Article\" OR SRC:PPR)"
+        },
+        {
+          "type": "atproto",
+          "name": "Bluesky (ME/CFS Forschung & News)",
+          "queries": [
+            "mecfs study",
+            "me/cfs forschung",
+            "mecfs research",
+            "chronic fatigue study",
+            "myalgic encephalomyelitis"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "edu_deals",
+      "name": "Rabatte Studierende/Dozierende",
+      "emoji": "🎓",
+      "enabled": true,
+      "min_relevance": "Mittel",
+      "focus": "Neue Rabattaktionen für Studierende und/oder Lehrende/Dozierende (Hochschule, Uni, Schule, Education-Programme) mit MINDESTENS 50 % Rabatt oder komplett kostenlos – z. B. Software, KI-Tools, Hardware, Bücher, Zeitschriften-/Streaming-Abos, Lernplattformen, Cloud-Credits. Zusätzlich zulässig: allgemeine Gratis-Angebote, die für Studium oder Lehre klar nützlich und hochwertig sind (z. B. Vollversionen von Software, E-Books, Kurse, Tools). Der Nutzer lehrt an einer Hochschule in Deutschland; Angebote müssen in Deutschland bzw. online nutzbar sein. Nicht melden: Rabatte unter 50 %, reine Cashback-Aktionen, Gewinnspiele, Ratgeber-/SEO-Artikel ohne konkretes neues Angebot, bereits bekannte Dauerangebote (z. B. GitHub Student Pack), sofern sich nichts Wesentliches geändert hat. Gib bei 'discount' den Rabatt an (z. B. '100 % / kostenlos', '60 %') und bei 'valid_until' das Ablaufdatum, falls bekannt.",
+      "categories": [
+        "Rabatt",
+        "Gratis",
+        "Sonstiges"
+      ],
+      "sources": [
+        {
+          "type": "rss",
+          "name": "mydealz Freebies",
+          "url": "https://www.mydealz.de/rss/gruppe/freebies"
+        },
+        {
+          "type": "rss",
+          "name": "mydealz Software",
+          "url": "https://www.mydealz.de/rss/gruppe/software",
+          "keywords": [
+            "student",
+            "studier",
+            "schüler",
+            "lehrer",
+            "lehrkr",
+            "dozent",
+            "education",
+            "edu",
+            "uni",
+            "hochschule",
+            "gratis",
+            "kostenlos",
+            "free",
+            "100%",
+            "100 %"
+          ]
+        },
+        {
+          "type": "rss",
+          "name": "mydealz Hot",
+          "url": "https://www.mydealz.de/rss/hot",
+          "keywords": [
+            "student",
+            "studier",
+            "schüler",
+            "lehrer",
+            "lehrkr",
+            "dozent",
+            "education",
+            "edu",
+            "uni",
+            "hochschule",
+            "gratis",
+            "kostenlos",
+            "freebie"
+          ]
+        },
+        {
+          "type": "rss",
+          "name": "Google News (DE)",
+          "url": "https://news.google.com/rss/search?q=(Studentenrabatt+OR+%22f%C3%BCr+Studierende%22+OR+%22f%C3%BCr+Lehrkr%C3%A4fte%22)+(kostenlos+OR+gratis+OR+Rabatt)+when:4d&hl=de&gl=DE&ceid=DE:de"
+        },
+        {
+          "type": "rss",
+          "name": "Google News (EN)",
+          "url": "https://news.google.com/rss/search?q=(%22free+for+students%22+OR+%22free+for+educators%22+OR+%22free+for+teachers%22+OR+%22student+discount%22)+when:4d&hl=en-US&gl=US&ceid=US:en"
+        },
+        {
+          "type": "atproto",
+          "name": "Bluesky (Studentenrabatte & Education Deals)",
+          "queries": [
+            "studentenrabatt",
+            "student discount",
+            "dozenten rabatt",
+            "free for students",
+            "free for educators"
+          ]
+        }
+      ]
+    }
+  ]
+}
