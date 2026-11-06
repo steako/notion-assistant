@@ -235,7 +235,7 @@ def handle_themen(chat_id: str) -> str:
 
     lines = ["📡 *Konfigurierte Themengebiete:*\n"]
     for t in topics:
-        status = "🟢 Aktiv" if t.get("active", True) else "⚪ Pausiert"
+        status = "🟢 Aktiv" if t.get("enabled", True) else "⚪ Pausiert"
         emoji = t.get("emoji", "📌")
         name = t.get("name", "Unbenannt")
         tid = t.get("id", "")
@@ -258,17 +258,15 @@ def handle_themen(chat_id: str) -> str:
 
 
 def handle_toggle(chat_id: str, topic_id: str, enable: bool) -> str:
+    if not topic_id.strip():
+        return f"Bitte Themen-ID angeben, z. B. `/{'an' if enable else 'aus'} parkinson`."
     if rss_monitor is None:
         return "Fehler: rss_monitor nicht verfügbar."
-    cfg = rss_monitor.load_feeds_config()
-    topic = rss_monitor.find_topic(cfg, topic_id)
-    if not topic:
-        return f"Thema `{topic_id}` nicht gefunden. Nutze `/themen` für die Liste."
-    
-    topic["active"] = enable
-    rss_monitor.save_feeds_config(cfg)
-    status_str = "aktiviert 🟢" if enable else "pausiert ⚪"
-    return f"Thema *{topic.get('name', topic_id)}* wurde {status_str}."
+    ok = rss_monitor.cmd_topic_set_enabled(topic_id.strip(), enable)
+    if ok:
+        status_str = "aktiviert 🟢" if enable else "pausiert ⚪"
+        return f"Thema `{topic_id}` wurde {status_str}."
+    return f"Thema `{topic_id}` nicht gefunden. Nutze `/themen` für die Liste."
 
 
 def handle_neu(chat_id: str, new_name: str) -> str:
@@ -295,9 +293,7 @@ def handle_loeschen(chat_id: str, topic_id: str) -> str:
     if rss_monitor is None:
         return "Fehler: rss_monitor nicht verfügbar."
     
-    import argparse as _ap
-    ns = _ap.Namespace(topic_id=topic_id.strip(), yes=True)
-    ok = rss_monitor.cmd_topic_remove(ns)
+    ok = rss_monitor.cmd_topic_remove(topic_id.strip(), confirm=True)
     if ok:
         return f"🗑️ Thema `{topic_id}` wurde gelöscht."
     return f"❌ Thema `{topic_id}` konnte nicht gelöscht werden (nicht gefunden?)."
@@ -309,15 +305,16 @@ def handle_run_async(chat_id: str, token: str) -> None:
         send_message(token, chat_id, "Fehler: rss_monitor nicht verfügbar.")
         return
 
-    # Lock prüfen
-    if rss_monitor.LOCK_FILE.exists():
-        try:
-            pid = int(rss_monitor.LOCK_FILE.read_text(encoding="utf-8").strip())
-            if rss_monitor.is_pid_running(pid):
+    # Lock prüfen (LOCK_PATH oder LOCK_FILE)
+    lock_path = getattr(rss_monitor, "LOCK_PATH", getattr(rss_monitor, "LOCK_FILE", BASE_DIR / "rss_monitor.lock"))
+    try:
+        if lock_path.exists():
+            pid = int(lock_path.read_text(encoding="utf-8").strip())
+            if hasattr(rss_monitor, "is_pid_running") and rss_monitor.is_pid_running(pid):
                 send_message(token, chat_id, f"⚠️ Ein Suchlauf läuft bereits im Hintergrund (PID {pid}). Bitte warte kurz.")
                 return
-        except Exception:
-            pass
+    except Exception as exc:
+        log.warning("Fehler bei Lock-Prüfung: %s", exc)
 
     send_message(
         token,
@@ -329,10 +326,30 @@ def handle_run_async(chat_id: str, token: str) -> None:
 
     def _worker():
         try:
-            import argparse as _ap
-            ns = _ap.Namespace(topic=None, dry_run=False, no_notify=False, no_notion=False, verbose=False)
-            res = rss_monitor.run(ns)
-            log.info("Manueller Telegram-Run beendet mit Code %s", res)
+            if hasattr(rss_monitor, "acquire_lock") and not rss_monitor.acquire_lock():
+                send_message(token, chat_id, "⚠️ Ein anderer Suchlauf ist noch aktiv. Bitte warte kurz.")
+                return
+
+            try:
+                import argparse as _ap
+                ns = _ap.Namespace(topic=None, dry_run=False, no_notify=False, no_notion=False, verbose=False)
+                res = rss_monitor.run(ns)
+                log.info("Manueller Telegram-Run beendet mit Code %s", res)
+
+                # Prüfen, ob neue Funde gemeldet wurden:
+                st = load_rss_state()
+                last_run = (st.get("runs") or [{}])[0]
+                new_cnt = last_run.get("new", 0)
+                if new_cnt == 0:
+                    send_message(
+                        token,
+                        chat_id,
+                        "✅ *Suchlauf abgeschlossen.*\n"
+                        "Es wurden keine neuen relevanten Studien oder Artikel gefunden – alle Quellen sind aktuell.",
+                    )
+            finally:
+                if hasattr(rss_monitor, "release_lock"):
+                    rss_monitor.release_lock()
         except Exception as exc:
             log.exception("Fehler beim manuellen Suchlauf: %s", exc)
             send_message(token, chat_id, f"❌ Fehler beim Suchlauf: {exc}")
@@ -384,7 +401,7 @@ def handle_status(chat_id: str) -> str:
     
     cfg = rss_monitor.load_feeds_config()
     topics = cfg.get("topics", [])
-    active_cnt = sum(1 for t in topics if t.get("active", True))
+    active_cnt = sum(1 for t in topics if t.get("enabled", True))
     paused_cnt = len(topics) - active_cnt
 
     # Letzter Lauf aus Digest oder Wissensspeicher
@@ -490,75 +507,82 @@ def process_updates(token: str, state: dict[str, Any], poll_timeout: int = 15) -
         if not chat_id:
             continue
 
-        # Chat-ID für Benachrichtigungen merken
-        if state.get("last_rss_chat_id") != chat_id:
-            state["last_rss_chat_id"] = chat_id
-            save_rss_state(state)
-            log.info("Chat-ID %s für RSS-Bot registriert.", chat_id)
+        try:
+            # Chat-ID für Benachrichtigungen merken
+            if state.get("last_rss_chat_id") != chat_id:
+                state["last_rss_chat_id"] = chat_id
+                save_rss_state(state)
+                log.info("Chat-ID %s für RSS-Bot registriert.", chat_id)
 
-        raw_text = (msg.get("text") or "").strip()
-        voice = msg.get("voice") or msg.get("audio")
+            raw_text = (msg.get("text") or "").strip()
+            voice = msg.get("voice") or msg.get("audio")
 
-        # Sprachnachricht transkribieren
-        if voice and assistant is not None:
-            file_id = voice.get("file_id")
-            if file_id:
-                try:
-                    f_req = urllib.request.Request(f"{api_base}/getFile?file_id={file_id}")
-                    with urllib.request.urlopen(f_req, timeout=15) as f_resp:
-                        f_info = json.loads(f_resp.read().decode("utf-8"))
-                        f_path = f_info.get("result", {}).get("file_path")
-                    if f_path:
-                        dl_url = f"https://api.telegram.org/file/bot{token}/{f_path}"
-                        tmp_audio = BASE_DIR / "temp" / f"voice_{int(time.time())}.ogg"
-                        tmp_audio.parent.mkdir(parents=True, exist_ok=True)
-                        with urllib.request.urlopen(dl_url, timeout=30) as dl, open(tmp_audio, "wb") as out:
-                            out.write(dl.read())
-                        cfg = assistant.load_config()
-                        raw_text = assistant.transcribe_audio(tmp_audio, cfg)
-                        send_message(token, chat_id, f"🎤 _Erkannt:_ „{raw_text}“")
-                        try:
-                            tmp_audio.unlink()
-                        except Exception:
-                            pass
-                except Exception as exc:
-                    log.warning("Fehler bei Audio-Download/Transkription: %s", exc)
+            # Sprachnachricht transkribieren
+            if voice and assistant is not None:
+                file_id = voice.get("file_id")
+                if file_id:
+                    try:
+                        f_req = urllib.request.Request(f"{api_base}/getFile?file_id={file_id}")
+                        with urllib.request.urlopen(f_req, timeout=15) as f_resp:
+                            f_info = json.loads(f_resp.read().decode("utf-8"))
+                            f_path = f_info.get("result", {}).get("file_path")
+                        if f_path:
+                            dl_url = f"https://api.telegram.org/file/bot{token}/{f_path}"
+                            tmp_audio = BASE_DIR / "temp" / f"voice_{int(time.time())}.ogg"
+                            tmp_audio.parent.mkdir(parents=True, exist_ok=True)
+                            with urllib.request.urlopen(dl_url, timeout=30) as dl, open(tmp_audio, "wb") as out:
+                                out.write(dl.read())
+                            cfg = assistant.load_config()
+                            raw_text = assistant.transcribe_audio(tmp_audio, cfg)
+                            send_message(token, chat_id, f"🎤 _Erkannt:_ „{raw_text}“")
+                            try:
+                                tmp_audio.unlink()
+                            except Exception:
+                                pass
+                    except Exception as exc:
+                        log.warning("Fehler bei Audio-Download/Transkription: %s", exc)
 
-        if not raw_text:
-            continue
+            if not raw_text:
+                continue
 
-        log.info("Empfangen von %s: %s", chat_id, raw_text[:60])
+            log.info("Empfangen von %s: %s", chat_id, raw_text[:60])
 
-        # Befehle auswerten
-        lower = raw_text.strip().lower()
-        parts = raw_text.strip().split()
-        cmd = parts[0].lower().split("@")[0]  # strip @RSS8472Bot
-        arg = " ".join(parts[1:]).strip()
+            # Befehle auswerten
+            lower = raw_text.strip().lower()
+            parts = raw_text.strip().split()
+            cmd = parts[0].lower().split("@")[0]  # strip @RSS8472Bot
+            arg = " ".join(parts[1:]).strip()
 
-        if cmd in ("/start", "/help", "hilfe", "start"):
-            send_message(token, chat_id, handle_start_or_help(chat_id))
-        elif cmd in ("/themen", "/topics", "themen"):
-            send_message(token, chat_id, handle_themen(chat_id))
-        elif cmd in ("/an", "/enable", "/aktivieren"):
-            send_message(token, chat_id, handle_toggle(chat_id, arg, enable=True))
-        elif cmd in ("/aus", "/disable", "/deaktivieren", "/pause"):
-            send_message(token, chat_id, handle_toggle(chat_id, arg, enable=False))
-        elif cmd in ("/neu", "/add"):
-            send_message(token, chat_id, handle_neu(chat_id, arg))
-        elif cmd in ("/loeschen", "/remove", "/del"):
-            send_message(token, chat_id, handle_loeschen(chat_id, arg))
-        elif cmd in ("/run", "/sync", "sync", "run"):
-            handle_run_async(chat_id, token)
-        elif cmd in ("/covid", "/corona", "covid"):
-            send_message(token, chat_id, handle_covid(chat_id))
-        elif cmd in ("/deals", "/rabatte", "deals", "rabatte"):
-            send_message(token, chat_id, handle_deals(chat_id))
-        elif cmd in ("/suche", "/search", "suche"):
-            send_message(token, chat_id, handle_suche(chat_id, arg))
-        elif cmd in ("/status", "status"):
-            send_message(token, chat_id, handle_status(chat_id))
-        else:
-            handle_natural_language(chat_id, raw_text, token)
+            if cmd in ("/start", "/help", "hilfe", "start"):
+                send_message(token, chat_id, handle_start_or_help(chat_id))
+            elif cmd in ("/themen", "/topics", "themen"):
+                send_message(token, chat_id, handle_themen(chat_id))
+            elif cmd in ("/an", "/enable", "/aktivieren"):
+                send_message(token, chat_id, handle_toggle(chat_id, arg, enable=True))
+            elif cmd in ("/aus", "/disable", "/deaktivieren", "/pause"):
+                send_message(token, chat_id, handle_toggle(chat_id, arg, enable=False))
+            elif cmd in ("/neu", "/add"):
+                send_message(token, chat_id, handle_neu(chat_id, arg))
+            elif cmd in ("/loeschen", "/remove", "/del"):
+                send_message(token, chat_id, handle_loeschen(chat_id, arg))
+            elif cmd in ("/run", "/sync", "sync", "run"):
+                handle_run_async(chat_id, token)
+            elif cmd in ("/covid", "/corona", "covid"):
+                send_message(token, chat_id, handle_covid(chat_id))
+            elif cmd in ("/deals", "/rabatte", "deals", "rabatte"):
+                send_message(token, chat_id, handle_deals(chat_id))
+            elif cmd in ("/suche", "/search", "suche"):
+                send_message(token, chat_id, handle_suche(chat_id, arg))
+            elif cmd in ("/status", "status"):
+                send_message(token, chat_id, handle_status(chat_id))
+            else:
+                handle_natural_language(chat_id, raw_text, token)
+        except Exception as exc:
+            log.exception("Fehler bei Verarbeitung von Nachricht aus Update %s: %s", update_id, exc)
+            try:
+                send_message(token, chat_id, f"❌ Ein interner Fehler ist aufgetreten: {exc}")
+            except Exception:
+                pass
 
     return count
 

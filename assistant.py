@@ -1950,6 +1950,20 @@ def process_telegram_updates(
             _send_telegram_message(api_base, chat_id, "\n".join(lines))
             continue
 
+        if cmd_lower in ("/run", "/sync", "run", "sync") or cmd_lower.startswith(("/run ", "/sync ")):
+            _send_telegram_message(api_base, chat_id, "📡 RSS-Monitor gestartet. Neue Funde werden gleich gemeldet...")
+            import threading
+            def _async_rss():
+                try:
+                    import rss_monitor
+                    import argparse as _ap
+                    ns = _ap.Namespace(topic=None, dry_run=False, no_notify=False, no_notion=False, verbose=False)
+                    rss_monitor.run(ns)
+                except Exception as _e:
+                    print(f"[RSS Telegram Run Error] {_e}")
+            threading.Thread(target=_async_rss, daemon=True).start()
+            continue
+
         if cmd_lower.startswith(("/themen", "/rss", "/topic")):
             parts = raw_text.split(maxsplit=2)
             subcmd = parts[1].lower() if len(parts) > 1 else "list"

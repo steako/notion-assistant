@@ -46,6 +46,7 @@ BASE_DIR = Path(__file__).resolve().parent
 FEEDS_PATH = BASE_DIR / "feeds.json"
 STATE_PATH = BASE_DIR / "rss_state.json"
 LOCK_PATH = BASE_DIR / "rss_monitor.lock"
+LOCK_FILE = LOCK_PATH
 LOG_PATH = BASE_DIR / "rss_monitor.log"
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) NotionRSSMonitor/1.0 (+stefan.kollmeier@hs-rm.de)"
