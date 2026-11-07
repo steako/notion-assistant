@@ -2844,6 +2844,104 @@ def trigger_restart() -> None:
     threading.Thread(target=_restart, daemon=True).start()
 
 
+SCHEDULER_STATE_PATH = BASE_DIR / "scheduler_state.json"
+SCHEDULER_LOG_PATH = BASE_DIR / "scheduler.log"
+
+# Standard-Zeitplan (überschreibbar via config.json -> "schedule").
+# "catchup_until": Bis zu dieser Uhrzeit wird ein verpasster Lauf (z. B. nach Neustart) noch nachgeholt.
+DEFAULT_SCHEDULE: dict[str, Any] = {
+    "enabled": True,
+    "timezone": "Europe/Berlin",
+    "jobs": [
+        {"id": "rss_morning", "time": "07:30", "catchup_until": "18:00", "command": ["rss_monitor.py", "run"]},
+        {"id": "briefing_morning", "time": "08:00", "catchup_until": "12:00",
+         "command": ["assistant.py", "briefing", "--mode", "morning", "--telegram"]},
+        {"id": "rss_evening", "time": "18:30", "catchup_until": "23:59", "command": ["rss_monitor.py", "run"]},
+        {"id": "briefing_evening", "time": "19:30", "catchup_until": "23:59",
+         "command": ["assistant.py", "briefing", "--mode", "evening", "--telegram"]},
+    ],
+}
+
+
+def _scheduler_now(tz_name: str) -> dt.datetime:
+    try:
+        from zoneinfo import ZoneInfo
+        return dt.datetime.now(ZoneInfo(tz_name))
+    except Exception:
+        return dt.datetime.now()
+
+
+def _parse_hhmm(value: str) -> dt.time:
+    hh, mm = str(value).strip().split(":", 1)
+    return dt.time(int(hh), int(mm))
+
+
+def _load_scheduler_state() -> dict[str, Any]:
+    try:
+        return json.loads(SCHEDULER_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_scheduler_state(sched_state: dict[str, Any]) -> None:
+    try:
+        SCHEDULER_STATE_PATH.write_text(json.dumps(sched_state, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception as exc:
+        print(f"[Scheduler] Konnte Zustand nicht speichern: {exc}")
+
+
+def run_scheduled_jobs(cfg: dict[str, Any], running: dict[str, Any]) -> None:
+    """Startet fällige Zeitplan-Jobs (RSS-Monitor, Morgen-/Abend-Briefing) als Subprozess.
+
+    Ersetzt den Windows Task Scheduler, damit der Daemon auch unter Linux/GCP (systemd) alles selbst erledigt.
+    `running` hält laufende Prozesse (job_id -> Popen), damit nichts doppelt startet.
+    """
+    schedule = {**DEFAULT_SCHEDULE, **(cfg.get("schedule") or {})}
+    if not schedule.get("enabled", True):
+        return
+
+    # Beendete Prozesse aufräumen
+    for job_id, proc in list(running.items()):
+        rc = proc.poll()
+        if rc is not None:
+            print(f"[Scheduler] Job '{job_id}' beendet (Exit-Code {rc}).")
+            running.pop(job_id, None)
+
+    now = _scheduler_now(schedule.get("timezone", "Europe/Berlin"))
+    today = now.date().isoformat()
+    sched_state = _load_scheduler_state()
+
+    for job in schedule.get("jobs", []):
+        job_id = job.get("id")
+        if not job_id or job.get("enabled", True) is False or job_id in running:
+            continue
+        if sched_state.get(job_id) == today:
+            continue
+        try:
+            start_t = _parse_hhmm(job["time"])
+            until_t = _parse_hhmm(job.get("catchup_until", "23:59"))
+        except Exception:
+            print(f"[Scheduler] Ungültige Zeitangabe für Job '{job_id}' – übersprungen.")
+            continue
+        if not (start_t <= now.time().replace(tzinfo=None) <= until_t):
+            continue
+
+        cmd = [sys.executable] + [str(BASE_DIR / job["command"][0])] + list(job["command"][1:])
+        try:
+            log_fh = open(SCHEDULER_LOG_PATH, "a", encoding="utf-8")
+            log_fh.write(f"\n===== {now.isoformat(timespec='seconds')} Start '{job_id}': {' '.join(cmd)} =====\n")
+            log_fh.flush()
+            proc = subprocess.Popen(cmd, cwd=BASE_DIR, stdout=log_fh, stderr=subprocess.STDOUT)
+            log_fh.close()
+            running[job_id] = proc
+            print(f"[Scheduler] Job '{job_id}' gestartet (PID {proc.pid}).")
+        except Exception as exc:
+            print(f"[Scheduler] Job '{job_id}' konnte nicht gestartet werden: {exc}")
+        # Auch bei Fehlschlag als erledigt markieren, um Endlos-Neustarts zu vermeiden
+        sched_state[job_id] = today
+        _save_scheduler_state(sched_state)
+
+
 def run_daemon(
     cfg: dict[str, Any],
     state_path: Path,
@@ -2899,11 +2997,18 @@ def run_daemon(
             print(f"[Daemon] Hinweis: Konnte RSS-Bot nicht starten: {_e}")
 
     last_full_sync = 0.0
+    scheduled_procs: dict[str, Any] = {}
 
     try:
         while True:
             state = load_local_state(state_path)
             now = time.time()
+
+            # Zeitplan: RSS 07:30/18:30, Briefing 08:00/19:30 (Europe/Berlin), holt verpasste Läufe nach
+            try:
+                run_scheduled_jobs(cfg, scheduled_procs)
+            except Exception as exc:
+                print(f"[Scheduler Hinweis] {exc}")
 
             # Alle 5 Minuten: Offene Tasks aus Notion aktualisieren, Drop-Ordner, Mails & Notion Inbox prüfen
             if now - last_full_sync >= 300:

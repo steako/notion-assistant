@@ -10,6 +10,7 @@
 local_state.json
 rss_state.json
 gcal_cache.json
+scheduler_state.json
 
 # Audio- und Notiz-Drops von unterwegs
 inbox_drop/*

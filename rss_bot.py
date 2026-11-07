@@ -422,9 +422,9 @@ def handle_status(chat_id: str) -> str:
         f"• Gesehene Artikel im Cache: *{seen_cnt}*",
         f"• Letzter Notion-Eintrag: *{last_entry}*",
         "",
-        "⏰ *Automatischer Zeitplan (Windows Task Scheduler):*",
-        "• Morgens: *07:30 Uhr* (`NotionLocalAssistant_RSS_Morning`)",
-        "• Abends: *18:30 Uhr* (`NotionLocalAssistant_RSS_Evening`)",
+        "⏰ *Automatischer Zeitplan (im Daemon integriert, Europe/Berlin):*",
+        "• Morgens: *07:30 Uhr*",
+        "• Abends: *18:30 Uhr*",
         "",
         "🔗 [Wissensspeicher in Notion öffnen](https://app.notion.com/p/c7bac0f9b2224aa6a0b42510fb987b7b)",
     ]
