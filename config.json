@@ -14,9 +14,21 @@
   },
   "llm": {
     "provider": "gemini",
-    "model": "gemini-3.8-flash",
+    "model": "gemini-3.5-flash-lite",
     "fast_model": "gemini-3.5-flash-lite",
-    "fallback_provider": "ollama"
+    "complex_model": "gemini-3.8-flash",
+    "fallback_provider": "ollama",
+    "tiers": {
+      "rss_summary": {"model": "gemini-3.5-flash-lite", "thinking_level": "minimal"},
+      "extract": {"model": "gemini-3.5-flash-lite", "thinking_level": "minimal"},
+      "intent": {"model": "gemini-3.5-flash-lite", "thinking_level": "minimal"},
+      "chat_simple": {"model": "gemini-3.5-flash-lite", "thinking_level": "minimal"},
+      "chat_complex": {"model": "gemini-3.8-flash", "thinking_level": "low"}
+    }
+  },
+  "chat": {
+    "max_iterations": 3,
+    "max_input_tokens": 12000
   },
   "transcription": {
     "provider": "gemini",

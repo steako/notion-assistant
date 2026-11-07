@@ -2,26 +2,15 @@
 
 Dieses Projekt verbindet deine mobile Sprach- und Text-Erfassung in **Notion** und per **Telegram** mit **Gemini 3.8 Flash** (oder rein lokal mit **Ollama & Whisper**), sodass deine Notizen, To-Dos und Kalendertermine präzise, fehlerfrei und ohne Spamming synchronisiert werden.
 
-## LLM- & Spracherkennungs-Modus
+## Optimierte Hybrid-Architektur (Gemini 3.5 Flash-Lite + 3.8 Flash + Jev)
 
-In [config.json](file:///c:/Projekte/Notion/config.json) ist standardmäßig **Gemini 3.8 Flash** als intelligenter Provider konfiguriert:
-- **Audio-Transkription:** Gemini Flash transkribiert Sprachnachrichten direkt aus dem Audio – fehlerfreies Deutsch, korrekte Zeichensetzung und Grammatik.
-- **Logik & Termine:** Exakte relative Kalender-Arithmetik (keine Termine in der Vergangenheit, kein Kauderwelsch).
-- **Automatischer Offline-Fallback:** Falls kein `GEMINI_API_KEY` gesetzt oder kein Internet da ist, greift das System automatisch auf deine lokalen Modelle (`devstral:24b` / `qwen3-coder:30b`) und `faster-whisper` zurück.
-- **Kein Task-Spamming:** Proaktive KI-Vorschläge werden nicht mehr als Aufgaben in deine To-Do-Liste geschaufelt, sondern bleiben als schlanke Impulse in der Notiz.
-
-### Privatsphäre & Kosten für Gemini 3.8 Flash
-- **Kosten:** Extrem günstig. 1 Mio. Input-Tokens kosten ca. $0.075, Audio ca. $0.002 pro Minute. Bei 10 Sprachnotizen und Fragen pro Tag liegen die monatlichen Gesamtkosten typischerweise bei **unter 0,20 € bis 0,40 €**.
-- **Privatsphäre (Pay-as-you-go im AI Studio):** Sobald du eine Abrechnungsmethode im Google Cloud / Google AI Studio Projekt hinterlegst, gilt die strikte Commercial Data Policy: **Keine Speicherung für Modell-Training, keine Human Reviewer, 100% vertrauliche Verarbeitung**.
-
-Trage deinen API-Key einfach in `c:\Projekte\Notion\.env` ein:
-```bash
-# Für deine privaten Sprachnotizen, Notizen & Termine (Pay-as-you-go mit voller Vertraulichkeit):
-GEMINI_API_KEY=AIzaSy...
-
-# Optional: Separater Free-Tier-Key für die öffentlichen RSS-Feeds & Studien-Zusammenfassung:
-GEMINI_FREE_API_KEY=AIzaSy...
-```
+Die Architektur wurde gezielt auf minimale Gemini-Kosten, höchste Geschwindigkeit und Schutz vor Token-Spitzen optimiert:
+- **Modell-Tiering mit Gemini 3.5 Flash-Lite:** Standardmäßig läuft die RSS-Zusammenfassung, Extraktion und Chat-Antworten über **`gemini-3.5-flash-lite`** mit `thinking_level: "minimal"`. Dadurch fallen keine teuren internen Reasoning-Tokens auf den Token-Preis an.
+- **Gemini 3.8 Flash als Eskalationspfad:** Wird gezielt für explizit komplexe Analysen (z. B. `/analyse`, tiefes Reasoning) genutzt mit `thinking_level: "low"`.
+- **Deterministisches Preprocessing vor KI-Calls (`preprocess.py`):** Entfernt HTML-Tags, Tracking-Parameter (`utm_*`, `fbclid`, `gclid`), Boilerplate-Phrasen und dedupliziert strikt über GUID, kanonische URL und Content-Hashes.
+- **TypeSafe AI (Jev System One):** Schnelles, ultra-günstiges Vorfilter- und Scoring-Modell (`jev-1.13.0`, $0.042/Mtok). Bewertet RSS-Relevanz vorab (`noul`), setzt Notion-Kategorien deterministisch (`choice`) und verwirft irrelevante Artikel vor dem Gemini-Aufruf.
+- **Chat-Guard & Loop-Bremse (`chat_guard.py`):** Striktes `max_iterations`-Limit (Standard: 3) und Token-Budget verhindert Endlosschleifen. Notion-Payloads werden deterministisch auf Kernfelder reduziert.
+- **Datenschutz-Guardrail:** Jev läuft standardmäßig nur für öffentliche RSS-Feeds. Im Chat ist Jev standardmäßig deaktiviert (`JEV_ALLOW_CHAT_ROUTING=false`), persönliche Daten (PII) werden vor jedem externen Call maskiert.
 
 ## Deine eingerichteten Notion-Seiten & Datenbanken
 

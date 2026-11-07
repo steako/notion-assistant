@@ -41,6 +41,9 @@ import feedparser  # type: ignore
 import requests
 
 import assistant  # bestehender Assistent: Config/.env, NotionClient, LLM-Auswahl, Benachrichtigungen
+import jev_client
+import llm_core
+import preprocess
 
 BASE_DIR = Path(__file__).resolve().parent
 FEEDS_PATH = BASE_DIR / "feeds.json"
@@ -91,31 +94,22 @@ def save_state(state: dict[str, Any]) -> None:
     tmp.replace(STATE_PATH)
 
 
+import preprocess
+
 def sha(text: str) -> str:
-    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+    return preprocess.sha(text)
 
 
 def strip_html(text: str) -> str:
-    text = re.sub(r"<[^>]+>", " ", text or "")
-    text = html.unescape(text)
-    return re.sub(r"\s+", " ", text).strip()
+    return preprocess.strip_html_and_boilerplate(text)
 
 
 def normalize_title(title: str) -> str:
-    t = title.lower()
-    t = re.sub(r"\s+[-–|]\s+[^-–|]{2,60}$", "", t)  # " - Publisher"-Suffix (Google News)
-    t = re.sub(r"[^a-z0-9äöüß ]+", " ", t)
-    return re.sub(r"\s+", " ", t).strip()
+    return preprocess.normalize_title(title)
 
 
 def item_fingerprints(item: dict[str, Any]) -> list[str]:
-    fps = []
-    if item.get("link"):
-        fps.append("l:" + sha(item["link"].split("?utm")[0]))
-    nt = normalize_title(item.get("title", ""))
-    if len(nt) > 15:
-        fps.append("t:" + sha(nt))
-    return fps
+    return preprocess.compute_item_fingerprints(item)
 
 
 def is_pid_running(pid: int) -> bool:
@@ -340,6 +334,9 @@ def fetch_atproto(source: dict[str, Any], max_age_days: int, max_items: int) -> 
 def collect_candidates(topic: dict[str, Any], settings: dict[str, Any], state: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
     max_age = int(settings.get("max_age_days", 10))
     max_items = int(settings.get("max_items_per_source", 25))
+    undated_policy = settings.get("undated_policy", "keep")
+    max_topic_candidates = int(settings.get("max_candidates_per_topic", 60))
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=max_age)
     seen = state["seen"]
     candidates: list[dict[str, Any]] = []
     run_fps: set[str] = set()
@@ -359,15 +356,29 @@ def collect_candidates(topic: dict[str, Any], settings: dict[str, Any], state: d
             continue
         fresh = 0
         for it in items:
-            fps = item_fingerprints(it)
+            clean_it = preprocess.filter_and_preprocess_feed_item(
+                it,
+                cutoff=cutoff,
+                undated_policy=undated_policy,
+                max_summary_length=1200,
+            )
+            if clean_it is None:
+                continue
+            fps = clean_it.get("fingerprints") or item_fingerprints(clean_it)
             if not fps or any(fp in seen or fp in run_fps for fp in fps):
                 continue
             run_fps.update(fps)
-            it["fingerprints"] = fps
-            candidates.append(it)
+            clean_it["fingerprints"] = fps
+            clean_it["source"] = it.get("source") or source.get("name")
+            candidates.append(clean_it)
             fresh += 1
         log.info("[%s] %-45s %3d Einträge, %3d neu", topic["id"], source.get("name", "")[:45], len(items), fresh)
-    return candidates, errors
+
+    # Schutz vor Batch-Spitzen: Begrenze auf die neuesten N Kandidaten pro Thema
+    capped = preprocess.cap_candidates(candidates, max_total=max_topic_candidates)
+    if len(capped) < len(candidates):
+        log.info("[%s] Kandidaten durch Cap von %d auf %d begrenzt.", topic["id"], len(candidates), len(capped))
+    return capped, errors
 
 
 # --------------------------------------------------------------------------------------
@@ -391,25 +402,25 @@ def get_gemini_api_key() -> tuple[str, str]:
 
 
 def llm_json(prompt: str, system: str, cfg: dict[str, Any]) -> dict[str, Any]:
-    """Gemini (bevorzugt Free Tier) mit Fallback auf lokales Ollama (großer Kontext)."""
+    """Gemini (bevorzugt Free Tier) mit Task-Tiering ('rss_summary') und Fallback auf Ollama."""
     key, key_name = get_gemini_api_key()
     provider = "gemini" if key else "ollama"
-    model = cfg.get("llm", {}).get("model", "gemini-3.8-flash")
+
+    # Modell und Thinking-Level auflösen (Standard: gemini-3.5-flash-lite, minimal)
+    model, thinking_level = llm_core.resolve_task_model("rss_summary", cfg)
 
     if provider == "gemini":
         try:
             from google import genai
-            from google.genai import types
-
             client = genai.Client(api_key=key)
-            resp = client.models.generate_content(
+            resp = llm_core.execute_gemini_call(
+                prompt=prompt,
+                client=client,
+                task="rss_summary",
                 model=model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=system,
-                    response_mime_type="application/json",
-                    temperature=0.2,
-                ),
+                thinking_level=thinking_level,
+                system_instruction=system,
+                response_mime_type="application/json",
             )
             return json.loads(resp.text or "{}")
         except Exception as exc:
@@ -419,14 +430,14 @@ def llm_json(prompt: str, system: str, cfg: dict[str, Any]) -> dict[str, Any]:
                 try:
                     log.info("Versuche Fallback auf GEMINI_API_KEY...")
                     client = genai.Client(api_key=main_key)
-                    resp = client.models.generate_content(
+                    resp = llm_core.execute_gemini_call(
+                        prompt=prompt,
+                        client=client,
+                        task="rss_summary",
                         model=model,
-                        contents=prompt,
-                        config=types.GenerateContentConfig(
-                            system_instruction=system,
-                            response_mime_type="application/json",
-                            temperature=0.2,
-                        ),
+                        thinking_level=thinking_level,
+                        system_instruction=system,
+                        response_mime_type="application/json",
                     )
                     return json.loads(resp.text or "{}")
                 except Exception as exc2:
@@ -434,26 +445,11 @@ def llm_json(prompt: str, system: str, cfg: dict[str, Any]) -> dict[str, Any]:
             else:
                 log.info("Fallback auf Ollama...")
 
-    ollama_cfg = cfg.get("ollama", {})
-    base_url = os.environ.get("OLLAMA_BASE_URL", ollama_cfg.get("base_url", "http://localhost:11434"))
-    models = [ollama_cfg.get("model", "devstral:24b"), *ollama_cfg.get("fallback_models", [])]
-    last_exc: Exception | None = None
-    for m in models:
-        payload = {
-            "model": m, "format": "json", "stream": False,
-            "options": {"num_ctx": 32768, "temperature": 0.2},
-            "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
-        }
-        try:
-            req = request.Request(f"{base_url.rstrip('/')}/api/chat", data=json.dumps(payload).encode("utf-8"),
-                                  headers={"Content-Type": "application/json"}, method="POST")
-            with request.urlopen(req, timeout=600) as r:
-                body = json.loads(r.read().decode("utf-8"))
-            return json.loads(body.get("message", {}).get("content", "{}"))
-        except Exception as exc:
-            last_exc = exc
-            log.warning("Ollama-Modell %s fehlgeschlagen: %s", m, exc)
-    raise RuntimeError(f"Kein LLM erreichbar: {last_exc}")
+    return llm_core.call_ollama_json_safe(
+        prompt=prompt,
+        system=system,
+        ollama_cfg=cfg.get("ollama", {}),
+    )
 
 
 SYSTEM_PROMPT = (
@@ -520,6 +516,110 @@ Antworte als JSON:
 Wenn nichts Neues und Relevantes dabei ist: {{"findings": [], "overview": ""}}"""
 
 
+def jev_prefilter_candidates(
+    topic: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    settings: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
+    """
+    Filtert und taggt RSS-Kandidaten vorab mit TypeSafe AI (Jev System One).
+
+    - Bewertet Relevanz per Noul (oder Score)
+    - Taggt Kategorie per Choice
+    - Nur Kandidaten mit Relevanz >= Threshold gehen an Gemini weiter
+    - Verworfene Kandidaten werden zurückgegeben, damit sie als 'gesehen' markiert werden (Kostenschutz!)
+    - Bei Jev-Fehler: Fallback gemäß JEV_FAILURE_MODE ('gemini' | 'abort')
+    """
+    client = jev_client.JevClient()
+    stats = {"in": len(candidates), "passed": 0, "dropped": 0, "errors": 0}
+
+    # Falls Jev nicht konfiguriert oder deaktiviert ist: alle an Gemini durchreichen
+    if not client.is_configured or not settings.get("jev_enabled", True):
+        log.info("[%s] Jev-Vorfilter inaktiv (kein TYPESAFE_API_KEY oder jev_enabled=false) -> alle %d Kandidaten an LLM.",
+                 topic["id"], len(candidates))
+        return candidates, [], stats
+
+    try:
+        threshold = float(os.environ.get("JEV_RELEVANCE_THRESHOLD", settings.get("jev_relevance_threshold", 0.7)))
+    except (ValueError, TypeError):
+        threshold = 0.7
+
+    try:
+        min_cat_conf = float(os.environ.get("JEV_CATEGORY_MIN_CONFIDENCE", settings.get("jev_category_min_confidence", 0.4)))
+    except (ValueError, TypeError):
+        min_cat_conf = 0.4
+
+    failure_mode = os.environ.get("JEV_FAILURE_MODE", settings.get("jev_failure_mode", "gemini")).strip().lower()
+
+    passed: list[dict[str, Any]] = []
+    dropped: list[dict[str, Any]] = []
+
+    # Kategorien für Jev-Choice vorbereiten
+    allowed_cats = topic.get("categories", ["Sonstiges"])
+    options: dict[str, str | None] = {cat: f"Kategorie {cat}" for cat in allowed_cats}
+    if "Sonstiges" not in options:
+        options["Sonstiges"] = "Keine der spezifischen Kategorien"
+
+    focus_desc = topic.get("focus", "")[:300]
+
+    for item in candidates:
+        state_text = f"Titel: {item.get('title', '')}\nQuelle: {item.get('source', '')}\nText: {item.get('summary', '')[:600]}"
+        questions = {
+            "is_relevant": {
+                "type": "noul",
+                "instructions": f"Passt diese Meldung substanziell zum Thema '{topic['name']}' und den folgenden Kriterien?\nKriterien: {focus_desc}",
+                "criteria": {
+                    "true": "Die Meldung ist eine relevante, substanzielle Neuerung/Studie/Aktion zum Thema.",
+                    "false": "Die Meldung ist irrelevant, reines Marketing, Randnotiz oder passt nicht zum Fokus.",
+                },
+            },
+            "category": {
+                "type": "choice",
+                "instructions": f"Welche Kategorie beschreibt die Meldung am besten?",
+                "criteria": options,
+            },
+        }
+
+        try:
+            res = client.system_one(state=state_text, questions=questions)
+            answers = res.get("answers", {})
+
+            # 1. Noul Relevanz
+            rel_prob = float(answers.get("is_relevant", {}).get("noul", 0.0))
+            item["jev_relevance"] = rel_prob
+
+            # 2. Choice Kategorie
+            cat_ans = answers.get("category", {})
+            cat_choice = str(cat_ans.get("choice") or "Sonstiges")
+            cat_conf = float(cat_ans.get("confidence", 0.0))
+            item["jev_category"] = cat_choice if cat_conf >= min_cat_conf else "Sonstiges"
+            item["jev_category_confidence"] = cat_conf
+
+            if rel_prob >= threshold:
+                passed.append(item)
+                stats["passed"] += 1
+            else:
+                dropped.append(item)
+                stats["dropped"] += 1
+
+        except Exception as exc:
+            stats["errors"] += 1
+            log.warning("[%s] Jev-Vorfilterfehler bei '%s': %s", topic["id"], item.get("title", "")[:40], exc)
+            if failure_mode == "abort":
+                log.info("[%s] JEV_FAILURE_MODE=abort -> Breche Vorfilter ab.", topic["id"])
+                # Bisherige nicht verwerfen, aber Abbrechen
+                return passed, dropped, stats
+            # Fallback 'gemini': Kandidat durchlassen
+            passed.append(item)
+            stats["passed"] += 1
+
+    log.info(
+        "jev_filter topic=%s in=%d passed=%d dropped=%d errors=%d threshold=%.2f model=%s",
+        topic["id"], stats["in"], stats["passed"], stats["dropped"], stats["errors"], threshold, client.model,
+    )
+    return passed, dropped, stats
+
+
 def evaluate_topic(
     topic: dict[str, Any],
     candidates: list[dict[str, Any]],
@@ -561,7 +661,14 @@ def evaluate_topic(
             srcs = [batch[i] for i in ids]
             primary = next((s for s in srcs if "news.google.com" not in s["link"]), srcs[0])
             dates = [s["published"] for s in srcs if s.get("published")]
-            cat = f.get("category") if f.get("category") in allowed_cats else "Sonstiges"
+
+            # Kategorie: Bevorzuge deterministisches Jev-Tagging, falls vorhanden
+            jev_cat = primary.get("jev_category")
+            if jev_cat and jev_cat in allowed_cats:
+                cat = jev_cat
+            else:
+                cat = f.get("category") if f.get("category") in allowed_cats else "Sonstiges"
+
             finding = {
                 "topic_id": topic["id"],
                 "topic_name": topic["name"],
@@ -846,6 +953,21 @@ def run(args: argparse.Namespace) -> int:
             results.append({"topic": topic, "findings": [], "overview": ""})
             continue
 
+        log.info("[%s] Starte Vorfilterung für %d Kandidaten...", topic["id"], len(candidates))
+        passed_cands, dropped_cands, filter_stats = jev_prefilter_candidates(topic, candidates, settings)
+
+        # Verworfene Kandidaten sofort als gesehen markieren (Schutz vor doppelter Bearbeitung)
+        if not args.dry_run and dropped_cands:
+            for dc in dropped_cands:
+                for fp in dc.get("fingerprints", []):
+                    state["seen"][fp] = now_iso
+            save_state(state)
+
+        if not passed_cands:
+            log.info("[%s] Alle %d Kandidaten durch Vorfilter/Schwellenwert verworfen.", topic["id"], len(candidates))
+            results.append({"topic": topic, "findings": [], "overview": ""})
+            continue
+
         known: list[dict[str, Any]] = []
         limit = int(settings.get("known_context_items", 150))
         if notion:
@@ -857,8 +979,13 @@ def run(args: argparse.Namespace) -> int:
         else:
             known = state["knowledge"].get(topic["id"], [])[:limit]
 
-        log.info("[%s] Bewerte %d Kandidaten gegen %d bekannte Einträge ...", topic["id"], len(candidates), len(known))
-        findings, overviews, evaluated = evaluate_topic(topic, candidates, known, settings, cfg)
+        # Schätzung der Token-Einsparung durch Jev-Vorfilterung (ca. 400 Tokens pro verworfenem Kandidat in Prompt/Thinking)
+        saved_est = filter_stats.get("dropped", 0) * 400
+        if saved_est > 0:
+            log.info("savings_est topic=%s dropped_tokens≈%d dropped_items=%d", topic["id"], saved_est, filter_stats.get("dropped", 0))
+
+        log.info("[%s] Bewerte %d gefilterte Kandidaten gegen %d bekannte Einträge ...", topic["id"], len(passed_cands), len(known))
+        findings, overviews, evaluated = evaluate_topic(topic, passed_cands, known, settings, cfg)
         log.info("[%s] %d neue relevante Funde.", topic["id"], len(findings))
 
         written: list[dict[str, Any]] = []
@@ -880,10 +1007,9 @@ def run(args: argparse.Namespace) -> int:
             })
 
         if not args.dry_run:
-            # Nur erfolgreich bewertete Kandidaten als gesehen markieren
-            # (bei LLM-Ausfall wird der Rest beim nächsten Lauf erneut geprüft).
+            # Erfolgreich von Gemini bewertete Kandidaten als gesehen markieren
             for c in evaluated:
-                for fp in c["fingerprints"]:
+                for fp in c.get("fingerprints", []):
                     state["seen"][fp] = now_iso
             state["knowledge"][topic["id"]] = state["knowledge"].get(topic["id"], [])[:500]
             save_state(state)

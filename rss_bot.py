@@ -432,8 +432,48 @@ def handle_status(chat_id: str) -> str:
 
 
 def handle_natural_language(chat_id: str, text: str, token: str) -> None:
-    """Behandelt Freitext-Fragen oder Notizen mit KI."""
-    # Intent oder Schnellsuche
+    """Behandelt Freitext-Fragen oder Notizen mit schnellem Jev-Choice-Router und Gemini-Tiering."""
+    import jev_client
+
+    # 1. Jev-Choice Intent-Router (schnell, günstig, deterministisch ohne Textgenerierung)
+    jclient = jev_client.JevClient()
+    if jclient.is_configured:
+        try:
+            options = {
+                "covid": "Fragen zu Covid-Zahlen, Inzidenz, Infektionslage oder Schätzungen von rv-enigma",
+                "deals": "Fragen zu Studenten- oder Dozenten-Rabatten, Aktionen, Deals, Freebies",
+                "suche": "Suche nach Begriffen, Studien oder Artikeln im Wissensspeicher",
+                "themen": "Übersicht, Aktivierung oder Verwaltung von RSS-Themen",
+                "run": "Suchlauf manuell starten oder aktualisieren",
+                "general_question": "Freie inhaltliche Frage zu den Forschungsthemen oder Feedback",
+            }
+            choice, conf, _ = jclient.evaluate_choice(
+                state=text[:250],
+                instructions="Welche Aktion oder welches Thema fragt der Nutzer im RSS-Bot an?",
+                options=options,
+                question_id="rss_bot_intent",
+            )
+            if conf >= 0.70:
+                if choice == "covid":
+                    send_message(token, chat_id, handle_covid(chat_id))
+                    return
+                elif choice == "deals":
+                    send_message(token, chat_id, handle_deals(chat_id))
+                    return
+                elif choice == "themen":
+                    send_message(token, chat_id, handle_themen(chat_id))
+                    return
+                elif choice == "run":
+                    handle_run_async(chat_id, token)
+                    return
+                elif choice == "suche":
+                    clean_q = re.sub(r"(?i)^(suche|finde|zeig mir)\s+", "", text).strip()
+                    send_message(token, chat_id, handle_suche(chat_id, clean_q or text))
+                    return
+        except Exception as jexc:
+            log.warning("Jev RSS-Bot Router Fehler (%s) – nutze Heuristik.", jexc)
+
+    # 2. Deterministische Heuristik als Fallback
     lower = text.lower()
     if any(k in lower for k in ["covid", "corona", "infiziert", "zahlen", "inzidenz"]):
         send_message(token, chat_id, handle_covid(chat_id))
@@ -446,7 +486,7 @@ def handle_natural_language(chat_id: str, text: str, token: str) -> None:
         send_message(token, chat_id, handle_suche(chat_id, q))
         return
 
-    # Mit Gemini / Ollama beantworten
+    # 3. Mit Gemini 3.5 Flash-Lite (Tier 'chat_simple', thinking=minimal) oder Ollama beantworten
     if assistant is not None:
         try:
             cfg = assistant.load_config()
@@ -458,7 +498,7 @@ def handle_natural_language(chat_id: str, text: str, token: str) -> None:
                 "Wenn er nach neuen Erkenntnissen oder Studien zu Parkinson, Long COVID, ME/CFS "
                 "oder Rabatten fragt, erkläre kurz die Relevanz oder verweise auf die Befehle /suche, /themen oder /run."
             )
-            reply = assistant.call_llm_text(prompt, cfg)
+            reply = assistant.call_llm_text(prompt, cfg, task="chat_simple")
             send_message(token, chat_id, reply)
             return
         except Exception as exc:

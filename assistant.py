@@ -34,6 +34,10 @@ from pathlib import Path
 from typing import Any
 from urllib import error, request
 
+import chat_guard
+import jev_client
+import llm_core
+
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
 ENV_PATH = BASE_DIR / ".env"
@@ -219,37 +223,45 @@ def call_llm_json(
     cfg: dict[str, Any],
     system_instruction: str | None = None,
     model_override: str | None = None,
+    task: str = "extract",
 ) -> dict[str, Any]:
-    """Ruft Gemini (Standard) oder lokales Ollama mit strukturierter JSON-Rückgabe auf."""
+    """Ruft Gemini (Standard) oder lokales Ollama mit strukturierter JSON-Rückgabe und optimiertem Thinking auf."""
     provider, default_model = get_llm_choice(cfg)
-    model_name = model_override or default_model
+
+    # Modell und Thinking-Level bestimmen
+    tier_model, tier_thinking = llm_core.resolve_task_model(task, cfg)
+    model_name = model_override or tier_model or default_model
 
     if provider == "gemini":
         try:
             from google import genai
-            from google.genai import types
 
             gemini_key = os.environ.get("GEMINI_API_KEY", "").strip() or os.environ.get("GOOGLE_API_KEY", "").strip()
             client = genai.Client(api_key=gemini_key)
-            config = types.GenerateContentConfig(
-                system_instruction=system_instruction or (
-                    "Du bist der persönliche deutsche KI-Assistent von Stefan Kollmeier. "
-                    "Analysiere präzise und antworte AUSSCHLIESSLICH mit einem validen JSON-Objekt."
-                ),
-                response_mime_type="application/json",
-                temperature=0.1,
+            system = system_instruction or (
+                "Du bist der persönliche deutsche KI-Assistent von Stefan Kollmeier. "
+                "Analysiere präzise und antworte AUSSCHLIESSLICH mit einem validen JSON-Objekt."
             )
-            response = client.models.generate_content(
+            resp = llm_core.execute_gemini_call(
+                prompt=prompt,
+                client=client,
+                task=task,
                 model=model_name,
-                contents=prompt,
-                config=config,
+                thinking_level=tier_thinking,
+                system_instruction=system,
+                response_mime_type="application/json",
             )
-            raw = response.text or "{}"
+            raw = resp.text or "{}"
             return json.loads(raw)
         except Exception as exc:
             print(f"[Gemini JSON Fehler] {exc} -> Fallback auf Ollama.")
 
-    return call_ollama_json(prompt, cfg.get("ollama", {}), model_override=model_override)
+    return llm_core.call_ollama_json_safe(
+        prompt=prompt,
+        system=system_instruction,
+        ollama_cfg=cfg.get("ollama", {}),
+        model_override=model_override,
+    )
 
 
 def call_llm_text(
@@ -257,36 +269,37 @@ def call_llm_text(
     cfg: dict[str, Any],
     system_instruction: str | None = None,
     model_override: str | None = None,
+    task: str = "chat_simple",
 ) -> str:
     """Ruft Gemini oder Ollama für Textantworten auf."""
     provider, default_model = get_llm_choice(cfg)
-    model_name = model_override or default_model
+    tier_model, tier_thinking = llm_core.resolve_task_model(task, cfg)
+    model_name = model_override or tier_model or default_model
 
     if provider == "gemini":
         try:
             from google import genai
-            from google.genai import types
 
             gemini_key = os.environ.get("GEMINI_API_KEY", "").strip() or os.environ.get("GOOGLE_API_KEY", "").strip()
             client = genai.Client(api_key=gemini_key)
-            config = types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=0.3,
-            ) if system_instruction else types.GenerateContentConfig(temperature=0.3)
-            response = client.models.generate_content(
+            resp = llm_core.execute_gemini_call(
+                prompt=prompt,
+                client=client,
+                task=task,
                 model=model_name,
-                contents=prompt,
-                config=config,
+                thinking_level=tier_thinking,
+                system_instruction=system_instruction,
             )
-            return (response.text or "").strip()
+            return (resp.text or "").strip()
         except Exception as exc:
             print(f"[Gemini Text Fehler] {exc} -> Fallback auf Ollama.")
 
     # Ollama Fallback
     ollama_cfg = cfg.get("ollama", {})
-    res = call_ollama_json(
-        prompt + "\n\nGib deine Antwort als JSON mit genau dem Feld 'answer': {\"answer\": \"...\"}",
-        ollama_cfg,
+    res = llm_core.call_ollama_json_safe(
+        prompt=prompt + "\n\nGib deine Antwort als JSON mit genau dem Feld 'answer': {\"answer\": \"...\"}",
+        system=system_instruction,
+        ollama_cfg=ollama_cfg,
         model_override=model_override,
     )
     return str(res.get("answer") or res.get("text") or "")
@@ -1680,6 +1693,21 @@ def answer_question(
         except Exception:
             pass
 
+    # Schlanke Payloads deterministisch filtern (spart >60% Kontext-Tokens)
+    slimmed_todos = [chat_guard.slim_task(t) for t in open_todos[:15]]
+    slimmed_cal = [chat_guard.slim_calendar_event(ev) for ev in all_cal[:20]]
+    slimmed_notes = [chat_guard.slim_recent_note(it.get("analysis", {})) for it in state.get("items", [])[-6:]]
+    slimmed_search = [chat_guard.slim_search_hit(h) for h in notion_knowledge[:4]]
+
+    cal_json = chat_guard.truncate_context_json(slimmed_cal, max_chars=1800)
+    todos_json = chat_guard.truncate_context_json(slimmed_todos, max_chars=1800)
+    notes_json = chat_guard.truncate_context_json(slimmed_notes, max_chars=1200)
+    search_json = chat_guard.truncate_context_json(slimmed_search, max_chars=800)
+
+    # Modell-Tiering: Nur bei expliziter Analyse auf gemini-3.8-flash eskalieren
+    is_complex = any(k in question.lower() for k in ("/analyse", "analysiere", "komplexe planung", "strategie", "mehrstufig"))
+    task_tier = "chat_complex" if is_complex else "chat_simple"
+
     ref_block = get_date_reference_block()
     prompt = f"""{ref_block}
 
@@ -1687,11 +1715,11 @@ Du bist der persönliche KI-Assistent & Co-Pilot von Stefan Kollmeier (Hochschul
 Stefan spricht oder schreibt dir über Telegram folgende Nachricht:
 "{question}"
 
-Hier ist sein aktueller Kontext (Live aus Google Kalender, Notion & lokalem Speicher):
-- Echte Kalendertermine (Google Kalender für die nächsten 14 Tage): {json.dumps(all_cal, ensure_ascii=False)}
-- Offene To-Dos (aus Notion Tasks): {json.dumps(open_todos, ensure_ascii=False)}
-- Zuletzt erfasste Notizen: {json.dumps(recent_notes, ensure_ascii=False)}
-- Relevante Notion-Seiten: {json.dumps(notion_knowledge, ensure_ascii=False)}
+Hier ist sein relevanter Kontext (Live aus Google Kalender, Notion & lokalem Speicher):
+- Echte Kalendertermine (nächste Tage): {cal_json}
+- Offene To-Dos (aus Notion Tasks): {todos_json}
+- Zuletzt erfasste Notizen: {notes_json}
+- Relevante Notion-Seiten: {search_json}
 
 Rolle & Verhalten:
 1. Antworte immer auf fehlerfreiem Deutsch, professionell, präzise, freundlich und auf den Punkt für einen Telegram-Chat.
@@ -1704,7 +1732,7 @@ Gib ein JSON-Objekt mit genau einem Feld "answer" (String) zurück:
 {{"answer": "..."}}"""
 
     try:
-        res = call_llm_json(prompt, cfg, model_override=model_override)
+        res = call_llm_json(prompt, cfg, model_override=model_override, task=task_tier)
         return str(res.get("answer") or "Ich konnte dazu leider keine passende Antwort generieren.")
     except Exception as exc:
         return f"Fehler bei der Antwortgenerierung: {exc}"
@@ -1767,9 +1795,36 @@ Gib ein JSON-Objekt zurück mit genau dieser Struktur:
   "correction_details": "Kurze Zusammenfassung was korrigiert werden soll oder null"
 }}"""
 
+    # Optionaler Jev-System-One-Vorfilter für schnelle Intent-Klassifikation
+    # Streng geschützt: Nur wenn JEV_ALLOW_CHAT_ROUTING explizit aktiv ist und PII maskiert wurde.
+    if jev_client.is_jev_chat_allowed():
+        jclient = jev_client.JevClient()
+        if jclient.is_configured:
+            try:
+                # Maskiere persönliche Kontaktdaten und begrenze auf kurze Metadaten
+                safe_text = jev_client.redact_pii_for_external_router(text, max_chars=180)
+                options = {
+                    "QUERY_CALENDAR": "Fragen zum Kalender, Tagesplan, Terminen heute/morgen, freie Zeit",
+                    "QUERY_TASKS": "Fragen zu offenen Aufgaben, To-Dos, fällige Tasks, Prioritäten",
+                    "SEARCH_KNOWLEDGE": "Suchen in Notion, Notizen, Dokumenten oder Wissensspeicher",
+                    "GENERAL_CHAT": "Allgemeine Fragen, E-Mail/Text vorformulieren, Brainstorming, Rat",
+                    "OTHER_ACTION": "Termin neu eintragen, ändern, absagen, Task updaten, erledigen oder Notiz",
+                }
+                choice, conf, _ = jclient.evaluate_choice(
+                    state=safe_text,
+                    instructions="Welche Intention hat die kurze Benutzer-Nachricht an den Assistenten?",
+                    options=options,
+                    question_id="chat_intent",
+                )
+                if conf >= 0.70 and choice in ("QUERY_CALENDAR", "QUERY_TASKS", "SEARCH_KNOWLEDGE", "GENERAL_CHAT"):
+                    print(f"[Jev Router] Slotfreier Intent '{choice}' mit Confidence {conf:.2f} deterministisch erkannt.")
+                    return {"intent": choice, "query": text}
+            except Exception as jexc:
+                print(f"[Jev Router Hinweis] {jexc} -> Fallback auf Gemini Flash-Lite.")
+
     fast_model = model_override or cfg.get("llm", {}).get("fast_model", "gemini-3.5-flash-lite")
     try:
-        return call_llm_json(prompt, cfg, model_override=fast_model)
+        return call_llm_json(prompt, cfg, model_override=fast_model, task="intent")
     except Exception as exc:
         print(f"[Intent Router Fallback] {exc}")
         if is_question_message(text):
@@ -2168,7 +2223,22 @@ def process_telegram_updates(
                 _send_telegram_message(api_base, chat_id, f"Fehler bei /themen: {exc}")
                 continue
 
-        # 3. Umfassendes Intent-Routing via KI (Gemini Flash / lokales Modell)
+        # 3. Harte Loop-Bremse & Token-Budget für den Chat-Turn
+        chat_cfg = cfg.get("chat", {})
+        budget = chat_guard.StepBudget(
+            max_iterations=int(chat_cfg.get("max_iterations", 3)),
+            max_estimated_tokens=int(chat_cfg.get("max_input_tokens", 12000)),
+        )
+
+        try:
+            budget.step(extra_text_len=len(raw_text))
+        except chat_guard.ChatBudgetExceeded as bexc:
+            print(f"[Telegram Chat-Guard] {bexc}")
+            _send_telegram_message(api_base, chat_id, f"⚠️ {bexc}")
+            count += 1
+            continue
+
+        # 4. Umfassendes Intent-Routing via KI (Jev / Gemini Flash-Lite / lokales Modell)
         print(f"[Telegram Router] Analysiere Nachricht: '{raw_text[:60]}...'")
         intent_info = classify_intent(raw_text, cfg, model_override=model_override)
         intent = intent_info.get("intent", "NOTE_OR_TASK")

@@ -2,10 +2,16 @@
   "settings": {
     "max_age_days": 10,
     "max_items_per_source": 25,
+    "max_candidates_per_topic": 60,
+    "undated_policy": "keep",
     "max_candidates_per_llm_call": 35,
     "known_context_items": 150,
     "min_relevance": "Mittel",
     "seen_retention_days": 180,
+    "jev_enabled": true,
+    "jev_relevance_threshold": 0.70,
+    "jev_category_min_confidence": 0.40,
+    "jev_failure_mode": "gemini",
     "create_digest_page": true,
     "notify_telegram": true,
     "notify_windows": true
