@@ -753,45 +753,75 @@ def get_gcalendar_bin() -> str | None:
 
 
 def parse_ics_events(ics_text: str, start_date: dt.date, end_date: dt.date) -> list[dict[str, Any]]:
-    """Parst Termine aus einem Standard-iCal/ICS-Feed (z. B. Google Calendar Secret iCal URL)."""
+    """Parst Termine aus iCal/ICS-Feeds inkl. Zeitzonenkonvertierung (Europe/Berlin) und Serienterminen (RRULE)."""
+    try:
+        from zoneinfo import ZoneInfo
+        tz_berlin = ZoneInfo("Europe/Berlin")
+    except Exception:
+        tz_berlin = None
+
     events: list[dict[str, Any]] = []
     # Zeilenfortsetzungen (RFC 5545 unfolding) auflösen
     unfolded = re.sub(r"\r?\n[ \t]", "", ics_text)
+
+    def _parse_dt(val: str) -> tuple[dt.date | None, str | None, dt.datetime | None]:
+        val = val.strip()
+        if "T" not in val:
+            # Ganztägiger Termin (YYYYMMDD)
+            try:
+                d = dt.date(int(val[:4]), int(val[4:6]), int(val[6:8]))
+                return d, None, None
+            except Exception:
+                return None, None, None
+        is_utc = val.endswith("Z")
+        clean = val.rstrip("Z")
+        try:
+            d_part, t_part = clean.split("T", 1)
+            base = dt.datetime(
+                int(d_part[:4]), int(d_part[4:6]), int(d_part[6:8]),
+                int(t_part[:2]), int(t_part[2:4]),
+                int(t_part[4:6]) if len(t_part) >= 6 else 0,
+            )
+            if is_utc and tz_berlin:
+                base = base.replace(tzinfo=dt.timezone.utc).astimezone(tz_berlin)
+            return base.date(), base.strftime("%H:%M"), base
+        except Exception:
+            return None, None, None
+
     in_event = False
     cur: dict[str, str] = {}
+    exdates: set[dt.date] = set()
 
     for raw_line in unfolded.splitlines():
         line = raw_line.strip()
         if line == "BEGIN:VEVENT":
             in_event = True
             cur = {}
+            exdates = set()
         elif line == "END:VEVENT" and in_event:
             in_event = False
-            dtstart = cur.get("DTSTART", "")
-            dtend = cur.get("DTEND", "")
+            if cur.get("STATUS", "").upper() == "CANCELLED":
+                continue
+
             summary = cur.get("SUMMARY", "Termin").replace("\\,", ",").replace("\\;", ";").replace("\\n", " ")
             loc = cur.get("LOCATION", "").replace("\\,", ",").replace("\\n", " ").strip()
             uid = cur.get("UID", "")
+            raw_start = cur.get("DTSTART", "")
+            raw_end = cur.get("DTEND", "")
 
-            if len(dtstart) >= 8 and dtstart[:8].isdigit():
-                d_str = f"{dtstart[:4]}-{dtstart[4:6]}-{dtstart[6:8]}"
-                try:
-                    ev_date = dt.date.fromisoformat(d_str)
-                except ValueError:
-                    continue
-                if start_date <= ev_date <= end_date:
-                    st_time = None
-                    en_time = None
-                    if "T" in dtstart and len(dtstart) >= 13:
-                        t_part = dtstart.split("T", 1)[1]
-                        st_time = f"{t_part[:2]}:{t_part[2:4]}"
-                    if "T" in dtend and len(dtend) >= 13:
-                        t_part = dtend.split("T", 1)[1]
-                        en_time = f"{t_part[:2]}:{t_part[2:4]}"
+            ev_date, st_time, _ = _parse_dt(raw_start)
+            if not ev_date:
+                continue
+            _, en_time, _ = _parse_dt(raw_end) if raw_end else (None, None, None)
+
+            rrule_raw = cur.get("RRULE", "")
+            if not rrule_raw:
+                # Einmaliger Termin
+                if start_date <= ev_date <= end_date and ev_date not in exdates:
                     events.append({
                         "id": uid,
                         "title": summary,
-                        "date": d_str,
+                        "date": ev_date.isoformat(),
                         "start_time": st_time,
                         "end_time": en_time,
                         "location": loc,
@@ -799,10 +829,100 @@ def parse_ics_events(ics_text: str, start_date: dt.date, end_date: dt.date) -> l
                         "source": "Google Kalender (ICS)",
                         "synced_to_gcal": True,
                     })
+            else:
+                # Serientermin (RRULE) für den relevanten Zeitfenster-Ausschnitt expandieren
+                parts = dict(p.split("=", 1) for p in rrule_raw.split(";") if "=" in p)
+                freq = parts.get("FREQ", "").upper()
+                interval = max(int(parts.get("INTERVAL", 1) or 1), 1)
+                byday_raw = parts.get("BYDAY", "")
+                byday_list = [d.strip() for d in byday_raw.split(",") if d.strip()]
+                until_date = None
+                if "UNTIL" in parts:
+                    u_d, _, _ = _parse_dt(parts["UNTIL"])
+                    until_date = u_d
+                count = int(parts.get("COUNT", 0) or 0) or None
+
+                day_map = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
+                target_wd = [day_map[d] for d in byday_list if d in day_map] or [ev_date.weekday()]
+
+                if freq == "WEEKLY":
+                    check_d = ev_date
+                    seen_cnt = 0
+                    while check_d <= end_date:
+                        if until_date and check_d > until_date:
+                            break
+                        if count and seen_cnt >= count:
+                            break
+                        w_diff = (check_d - ev_date).days // 7
+                        if w_diff % interval == 0 and check_d.weekday() in target_wd:
+                            seen_cnt += 1
+                            if check_d >= start_date and check_d not in exdates:
+                                events.append({
+                                    "id": f"{uid}_{check_d.isoformat()}",
+                                    "title": summary,
+                                    "date": check_d.isoformat(),
+                                    "start_time": st_time,
+                                    "end_time": en_time,
+                                    "location": loc,
+                                    "link": "",
+                                    "source": "Google Kalender (ICS)",
+                                    "synced_to_gcal": True,
+                                })
+                        check_d += dt.timedelta(days=1)
+                elif freq == "DAILY":
+                    check_d = ev_date
+                    seen_cnt = 0
+                    while check_d <= end_date:
+                        if until_date and check_d > until_date:
+                            break
+                        if count and seen_cnt >= count:
+                            break
+                        d_diff = (check_d - ev_date).days
+                        if d_diff % interval == 0:
+                            seen_cnt += 1
+                            if check_d >= start_date and check_d not in exdates:
+                                events.append({
+                                    "id": f"{uid}_{check_d.isoformat()}",
+                                    "title": summary,
+                                    "date": check_d.isoformat(),
+                                    "start_time": st_time,
+                                    "end_time": en_time,
+                                    "location": loc,
+                                    "link": "",
+                                    "source": "Google Kalender (ICS)",
+                                    "synced_to_gcal": True,
+                                })
+                        check_d += dt.timedelta(days=1)
+                elif freq == "MONTHLY":
+                    for month_offset in range(0, 4):
+                        y = ev_date.year + (ev_date.month + month_offset - 1) // 12
+                        m = (ev_date.month + month_offset - 1) % 12 + 1
+                        try:
+                            check_d = dt.date(y, m, ev_date.day)
+                            if start_date <= check_d <= end_date and check_d not in exdates:
+                                events.append({
+                                    "id": f"{uid}_{check_d.isoformat()}",
+                                    "title": summary,
+                                    "date": check_d.isoformat(),
+                                    "start_time": st_time,
+                                    "end_time": en_time,
+                                    "location": loc,
+                                    "link": "",
+                                    "source": "Google Kalender (ICS)",
+                                    "synced_to_gcal": True,
+                                })
+                        except Exception:
+                            pass
         elif in_event and ":" in line:
             k_part, val = line.split(":", 1)
             key = k_part.split(";", 1)[0].upper()
-            cur[key] = val.strip()
+            if key == "EXDATE":
+                for ex in val.split(","):
+                    ex_d, _, _ = _parse_dt(ex)
+                    if ex_d:
+                        exdates.add(ex_d)
+            else:
+                cur[key] = val.strip()
 
     events.sort(key=lambda x: (x.get("date") or "", x.get("start_time") or "00:00"))
     return events
@@ -1059,17 +1179,48 @@ def fetch_google_calendar_events(days_ahead: int = 14) -> list[dict[str, Any]]:
             print(f"[Google Kalender CLI Hinweis] {exc}")
 
     # 2. Versuch: Google Calendar Secret iCal URL (falls konfiguriert)
-    ics_url = os.environ.get("GOOGLE_CALENDAR_ICS_URL", "").strip()
-    if ics_url:
-        try:
-            req = request.Request(ics_url, headers={"User-Agent": "NotionLocalAssistant/1.0"})
-            with request.urlopen(req, timeout=15) as resp:
-                ics_text = resp.read().decode("utf-8", errors="replace")
-            events_out = parse_ics_events(ics_text, today, end_date)
-            if events_out:
-                return events_out
-        except Exception as exc:
-            print(f"[Google Kalender ICS Hinweis] {exc}")
+    ics_urls_raw = os.environ.get("GOOGLE_CALENDAR_ICS_URL", "").strip()
+    if ics_urls_raw:
+        for single_url in re.split(r"[\r\n,;]+", ics_urls_raw):
+            single_url = single_url.strip()
+            if not single_url or not single_url.startswith(("http://", "https://")):
+                continue
+            try:
+                req = request.Request(single_url, headers={"User-Agent": "NotionLocalAssistant/1.0"})
+                with request.urlopen(req, timeout=15) as resp:
+                    ics_text = resp.read().decode("utf-8", errors="replace")
+                parsed = parse_ics_events(ics_text, today, end_date)
+                events_out.extend(parsed)
+            except Exception as exc:
+                print(f"[Google Kalender ICS Hinweis] Fehler beim Abrufen ({single_url[:40]}...): {exc}")
+
+        if events_out:
+            # Deduplizieren
+            seen = set()
+            deduped = []
+            for ev in events_out:
+                k = (ev.get("title"), ev.get("date"), ev.get("start_time"))
+                if k not in seen:
+                    seen.add(k)
+                    deduped.append(ev)
+            events_out = deduped
+            # Im Cache sichern für Offline- & Daemon-Betrieb
+            try:
+                GCAL_CACHE_PATH.write_text(
+                    json.dumps(
+                        {
+                            "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
+                            "events": events_out,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+            events_out.sort(key=lambda x: (x.get("date") or "", x.get("start_time") or "00:00"))
+            return events_out
 
     # 3. Fallback: Lokaler Kalender-Cache (gcal_cache.json)
     if GCAL_CACHE_PATH.exists():
@@ -1927,36 +2078,82 @@ def process_telegram_updates(
         cmd_lower = raw_text.lower().strip()
 
         # 2. Direkte Bot-Kommandos (Schnellzugriff)
-        if cmd_lower.startswith(("/status", "/dienst", "/info")):
+        if cmd_lower in ("status", "dienst", "info", "zeitplan", "schedule", "läufe", "laeufe") or cmd_lower.startswith(("/status", "/dienst", "/info", "/zeitplan", "/schedule", "status ", "zeitplan ")):
             sched_state = _load_scheduler_state()
             now_berlin = _scheduler_now("Europe/Berlin")
             time_str = now_berlin.strftime("%H:%M Uhr (%d.%m.%Y)")
+            today_str = now_berlin.date().isoformat()
+            now_t = now_berlin.time().replace(tzinfo=None)
             sched_cfg = {**DEFAULT_SCHEDULE, **(cfg.get("schedule") or {})}
             job_lines = []
+            job_names = {
+                "rss_morning": "📰 RSS-Monitor Morgen",
+                "briefing_morning": "☀️ Morgen-Briefing",
+                "rss_evening": "📰 RSS-Monitor Abend",
+                "briefing_evening": "🌙 Abend-Briefing",
+            }
             for j in sched_cfg.get("jobs", []):
                 jid = j.get("id", "")
                 jtime = j.get("time", "")
-                last_run = sched_state.get(jid, "noch nicht gelaufen")
-                icon = "☀️" if "morning" in jid else ("🌙" if "evening" in jid else "📰")
-                job_lines.append(f"• {icon} *{jid}* ({jtime} Uhr) -> Letzter Lauf: `{last_run}`")
+                j_name = job_names.get(jid, f"📌 {jid}")
+                last_run = sched_state.get(jid)
+                already_ran_today = (last_run == today_str)
 
-            cal_cnt = len(fetch_google_calendar_events(days_ahead=7))
+                # Nächsten Lauf exakt berechnen
+                try:
+                    start_t = _parse_hhmm(jtime)
+                    if not already_ran_today and now_t < start_t:
+                        next_run_str = f"Heute, {jtime} Uhr"
+                    else:
+                        next_run_str = f"Morgen, {jtime} Uhr"
+                except Exception:
+                    next_run_str = f"Geplant um {jtime} Uhr"
+
+                if already_ran_today:
+                    last_label = f"Heute gelaufen ({jtime} Uhr)"
+                elif last_run:
+                    last_label = f"{last_run}"
+                else:
+                    last_label = "noch nicht gelaufen"
+
+                job_lines.append(f"• *{j_name}* ({jtime} Uhr)\n   ↳ Zuletzt: `{last_label}` | Nächster Lauf: *{next_run_str}*")
+
+            cal_events = fetch_google_calendar_events(days_ahead=7)
+            cal_cnt = len(cal_events)
             todo_cnt = len([t for t in state.get("tasks", []) if t.get("kind") == "To-Do" and t.get("status") != "Erledigt"])
+
+            if cal_cnt > 0:
+                cal_details = []
+                for ev in cal_events[:4]:
+                    t_str = f" um {ev['start_time']} Uhr" if ev.get("start_time") else " (Ganztägig)"
+                    loc_str = f" [{ev['location']}]" if ev.get("location") else ""
+                    cal_details.append(f"   ↳ *{ev.get('date')}*{t_str}: {ev.get('title')}{loc_str}")
+                cal_section = f"📅 *Google Kalender:* {cal_cnt} Termine in den nächsten 7 Tagen:\n" + "\n".join(cal_details)
+            else:
+                has_ics = bool(os.environ.get("GOOGLE_CALENDAR_ICS_URL", "").strip())
+                has_gcal = bool(get_gcalendar_bin())
+                if has_ics or has_gcal:
+                    cal_section = "📅 *Google Kalender:* 0 Termine in den nächsten 7 Tagen gefunden (Feed aktiv)."
+                else:
+                    cal_section = (
+                        "📅 *Google Kalender:* Keine Termine gefunden (Quelle fehlt)\n"
+                        "   ⚠️ _Tipp: Trage `GOOGLE_CALENDAR_ICS_URL` in `.env` ein (Google Kalender -> Einstellungen -> Privatadresse im iCal-Format kopieren)._"
+                    )
 
             status_text = (
                 f"🤖 *Assistent & Scheduler Status*\n\n"
                 f"🕒 *Serverzeit (Berlin):* {time_str}\n"
                 f"💬 *Deine Chat-ID:* `{chat_id}` (aktiv registriert)\n"
                 f"✅ *Notion Tasks:* {todo_cnt} offene Aufgaben\n"
-                f"📅 *Google Kalender:* {cal_cnt} Termine in den nächsten 7 Tagen\n\n"
-                f"⏰ *Automatischer Zeitplan:*\n" + "\n".join(job_lines) + "\n\n"
-                f"Tipp: Mit `/morgen` oder `/briefing` kannst du dein Tages-Briefing jederzeit manuell anfordern."
+                f"{cal_section}\n\n"
+                f"⏰ *Automatischer Zeitplan (nächste Läufe):*\n" + "\n".join(job_lines) + "\n\n"
+                f"Tipp: Mit `/morgen` oder `/abend` kannst du dein Briefing jederzeit manuell anfordern."
             )
             _send_telegram_message(api_base, chat_id, status_text)
             count += 1
             continue
 
-        if cmd_lower.startswith(("/start", "/help", "/hilfe")):
+        if cmd_lower in ("start", "help", "hilfe") or cmd_lower.startswith(("/start", "/help", "/hilfe")):
             _send_telegram_message(
                 api_base,
                 chat_id,
@@ -1994,13 +2191,13 @@ def process_telegram_updates(
             count += 1
             continue
 
-        if cmd_lower.startswith(("/briefing", "/morgen")):
+        if cmd_lower in ("briefing", "morgen") or cmd_lower.startswith(("/briefing", "/morgen", "briefing ", "morgen ")):
             briefing_msg = generate_briefing(cfg, state, notify=False, mode="morning")
             _send_telegram_message(api_base, chat_id, briefing_msg)
             count += 1
             continue
 
-        if cmd_lower.startswith("/abend"):
+        if cmd_lower in ("abend", "nacht", "checkliste") or cmd_lower.startswith(("/abend", "abend ")):
             briefing_msg = generate_briefing(cfg, state, notify=False, mode="evening")
             _send_telegram_message(api_base, chat_id, briefing_msg)
             count += 1

@@ -124,6 +124,33 @@ python assistant.py add --title "Idee für Vorlesung" --text "Bis Freitag Folien
 python assistant.py briefing --notify
 ```
 
+### 4. Dauerhafter 24/7 Hintergrund-Dienst (Linux VM / GCP / Server)
+```bash
+python assistant.py daemon
+```
+Steuert automatisch alle zeitgesteuerten Aufgaben:
+- **07:30 Uhr:** RSS-Recherche & Morgen-Briefing per Telegram
+- **18:30 Uhr:** Abend-RSS-Recherche
+- **19:30 Uhr:** Abend-Briefing (Rückblick & Vorschau)
+- **Alle 15 Min:** Schnelle Inbox-Prüfung
+- **Kontinuierlich:** Telegram-Bot-Polling mit Befehlen (`/status`, `/update`, `/morgen`, `/abend`, `/themen`, `/run`, etc.)
+
+---
+
+## 📅 Google Kalender Integration (iCal)
+
+Für Systeme ohne lokales `gcalendar` CLI (wie GCP Linux VMs):
+1. Öffne Google Kalender im Browser.
+2. Klicke links neben deinem Kalender auf die drei Punkte `⋮` -> **Einstellungen und Freigabe**.
+3. Scrolle nach unten zu **Privatadresse im iCal-Format** und kopiere die geheime URL (endet auf `.ics`).
+4. Füge die URL in deiner `.env` ein:
+   ```env
+   GOOGLE_CALENDAR_ICS_URL=https://calendar.google.com/calendar/ical/.../basic.ics
+   ```
+   *(Tipp: Mehrere Kalender können kommagetrennt eingetragen werden: `URL1,URL2`)*
+
+Der Parser unterstützt automatische Zeitzonen-Konvertierung nach `Europe/Berlin`, Serientermine (`RRULE` wie wöchentliche Termine) sowie Ausnahmen (`EXDATE`).
+
 ---
 
 ## Vollautomatischer Hintergrund-Sync ohne Antigravity
