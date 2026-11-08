@@ -1886,9 +1886,13 @@ def process_telegram_updates(
             print(f"[Telegram] Ignoriere Nachricht von unbekannter Chat-ID {chat_id}.")
             continue
 
-        # Chat-ID automatisch für automatische Morgen-/Abend-Briefings merken
+        # Chat-ID automatisch für automatische Morgen-/Abend-Briefings merken & sofort sichern
         if chat_id:
-            state["last_telegram_chat_id"] = chat_id
+            state["last_telegram_chat_id"] = str(chat_id)
+            try:
+                save_local_state(BASE_DIR / cfg["paths"]["local_state_file"], state)
+            except Exception:
+                pass
 
         raw_text = ""
         source = "Telegram"
@@ -1920,6 +1924,35 @@ def process_telegram_updates(
         cmd_lower = raw_text.lower().strip()
 
         # 2. Direkte Bot-Kommandos (Schnellzugriff)
+        if cmd_lower.startswith(("/status", "/dienst", "/info")):
+            sched_state = _load_scheduler_state()
+            now_berlin = _scheduler_now("Europe/Berlin")
+            time_str = now_berlin.strftime("%H:%M Uhr (%d.%m.%Y)")
+            sched_cfg = {**DEFAULT_SCHEDULE, **(cfg.get("schedule") or {})}
+            job_lines = []
+            for j in sched_cfg.get("jobs", []):
+                jid = j.get("id", "")
+                jtime = j.get("time", "")
+                last_run = sched_state.get(jid, "noch nicht gelaufen")
+                icon = "☀️" if "morning" in jid else ("🌙" if "evening" in jid else "📰")
+                job_lines.append(f"• {icon} *{jid}* ({jtime} Uhr) -> Letzter Lauf: `{last_run}`")
+
+            cal_cnt = len(fetch_google_calendar_events(days_ahead=7))
+            todo_cnt = len([t for t in state.get("tasks", []) if t.get("kind") == "To-Do" and t.get("status") != "Erledigt"])
+
+            status_text = (
+                f"🤖 *Assistent & Scheduler Status*\n\n"
+                f"🕒 *Serverzeit (Berlin):* {time_str}\n"
+                f"💬 *Deine Chat-ID:* `{chat_id}` (aktiv registriert)\n"
+                f"✅ *Notion Tasks:* {todo_cnt} offene Aufgaben\n"
+                f"📅 *Google Kalender:* {cal_cnt} Termine in den nächsten 7 Tagen\n\n"
+                f"⏰ *Automatischer Zeitplan:*\n" + "\n".join(job_lines) + "\n\n"
+                f"Tipp: Mit `/morgen` oder `/briefing` kannst du dein Tages-Briefing jederzeit manuell anfordern."
+            )
+            _send_telegram_message(api_base, chat_id, status_text)
+            count += 1
+            continue
+
         if cmd_lower.startswith(("/start", "/help", "/hilfe")):
             _send_telegram_message(
                 api_base,
@@ -1944,6 +1977,7 @@ def process_telegram_updates(
                 "• E-Mails/Nachrichten formulieren: *„Formuliere eine E-Mail an...“*\n"
                 "• Brainstorming, Fragen & Tagesplanung\n\n"
                 "⚡ **Schnellbefehle:**\n"
+                "• `/status` – Status von Assistent, Scheduler & Chat-ID prüfen\n"
                 "• `/morgen` oder `/briefing` – Dein Tages-Briefing\n"
                 "• `/abend` – Deine Abend-Checkliste\n"
                 "• `/kalender` – Terminvorschau (7 Tage)\n"
@@ -1954,16 +1988,19 @@ def process_telegram_updates(
                 "• `/themen` – RSS-Themengebiete verwalten (/themen an|aus|neu|run)\n"
                 "• `/update` – Neuesten Code von GitHub laden & Assistenten neu starten",
             )
+            count += 1
             continue
 
         if cmd_lower.startswith(("/briefing", "/morgen")):
             briefing_msg = generate_briefing(cfg, state, notify=False, mode="morning")
             _send_telegram_message(api_base, chat_id, briefing_msg)
+            count += 1
             continue
 
         if cmd_lower.startswith("/abend"):
             briefing_msg = generate_briefing(cfg, state, notify=False, mode="evening")
             _send_telegram_message(api_base, chat_id, briefing_msg)
+            count += 1
             continue
 
         if cmd_lower.startswith("/kalender"):
@@ -1995,6 +2032,7 @@ def process_telegram_updates(
                     loc_str = f" 📍 {e['location']}" if e.get("location") else ""
                     lines.append(f"• **{d_label}**{t_str}: {e.get('title')}{loc_str}")
                 _send_telegram_message(api_base, chat_id, "\n".join(lines))
+            count += 1
             continue
 
         if cmd_lower.startswith("/todos"):
@@ -2008,6 +2046,7 @@ def process_telegram_updates(
                     lines.append(f"{i}. [{t.get('priority', 'Mittel')}]{due} **{t.get('title')}**")
                 lines.append("\nZum Abhaken: `/erledigt 1, 3` (mehrere), `/erledigt 1-3` (Bereich) oder per Name/Sprache!")
                 _send_telegram_message(api_base, chat_id, "\n".join(lines))
+            count += 1
             continue
 
         if cmd_lower.startswith("/ideen"):
@@ -2027,6 +2066,7 @@ def process_telegram_updates(
                 for i, s in enumerate(recent_sugs, 1):
                     lines.append(f"{i}. **{s.get('title')}**\n   ↳ {s.get('next_step', '')}")
                 _send_telegram_message(api_base, chat_id, "\n".join(lines))
+            count += 1
             continue
 
         if cmd_lower.startswith(("/mails", "/email", "/emails")):
@@ -2036,6 +2076,7 @@ def process_telegram_updates(
                 _send_telegram_message(api_base, chat_id, f"✅ {mail_count} neue E-Mail(s) ausgewertet und in Notion AI Inbox & Tasks übertragen.")
             else:
                 _send_telegram_message(api_base, chat_id, "ℹ️ Keine neuen ungelesenen E-Mails mit dem Label 'Assistent' gefunden.")
+            count += 1
             continue
 
         if cmd_lower.startswith(("/erledigt", "/done")):
@@ -2044,6 +2085,7 @@ def process_telegram_updates(
             open_todos = [t for t in state.get("tasks", []) if t.get("kind") == "To-Do" and t.get("status") != "Erledigt"]
             if not open_todos:
                 _send_telegram_message(api_base, chat_id, "✅ Du hast aktuell keine offenen To-Dos!")
+                count += 1
                 continue
 
             if not arg:
@@ -2056,6 +2098,7 @@ def process_telegram_updates(
                     "• `/erledigt Video schneiden` (nach Name/Stichwort)\n\n"
                     "📋 Liste deiner Aufgaben anzeigen: `/todos`",
                 )
+                count += 1
                 continue
 
             target_tasks = resolve_tasks_to_complete(arg, open_todos)
@@ -2092,6 +2135,7 @@ def process_telegram_updates(
                     f"⚠️ Konnte keine passende offene Aufgabe zu „{arg}“ finden.\n"
                     f"Nutze `/todos` für die aktuelle Nummernliste.",
                 )
+                count += 1
                 continue
 
         if cmd_lower.startswith(("/suche", "/search")):
@@ -2099,6 +2143,7 @@ def process_telegram_updates(
             search_query = parts[1].strip() if len(parts) > 1 else ""
             if not search_query:
                 _send_telegram_message(api_base, chat_id, "Bitte Suchbegriff angeben, z. B. `/suche Life on Pause`.")
+                count += 1
                 continue
             notion_results = notion.search_workspace(search_query, limit=5) if notion else []
             matching_notes = [
@@ -2118,12 +2163,14 @@ def process_telegram_updates(
             if not notion_results and not matching_notes:
                 lines.append("Keine Treffer in Notion oder Notizen gefunden.")
             _send_telegram_message(api_base, chat_id, "\n".join(lines))
+            count += 1
             continue
 
         if cmd_lower in ("/update", "/upgrade", "update", "/pull"):
             _send_telegram_message(api_base, chat_id, "⏳ Prüfe GitHub auf Updates...")
             needs_restart, update_msg = perform_self_update()
             _send_telegram_message(api_base, chat_id, update_msg)
+            count += 1
             if needs_restart:
                 trigger_restart()
             continue
@@ -2140,6 +2187,7 @@ def process_telegram_updates(
                 except Exception as _e:
                     print(f"[RSS Telegram Run Error] {_e}")
             threading.Thread(target=_async_rss, daemon=True).start()
+            count += 1
             continue
 
         if cmd_lower.startswith(("/themen", "/rss", "/topic")):
@@ -2164,34 +2212,40 @@ def process_telegram_updates(
                     lines.append("• `/themen neu <Name>` – Neues Thema per KI generieren")
                     lines.append("• `/themen run` – Jetzt sofort Feeds abfragen")
                     _send_telegram_message(api_base, chat_id, "\n".join(lines))
+                    count += 1
                     continue
 
                 elif subcmd in ("an", "on", "enable", "aktivieren"):
                     if not arg:
                         _send_telegram_message(api_base, chat_id, "Bitte Themen-ID angeben, z. B. `/themen an parkinson`.")
+                        count += 1
                         continue
                     ok = rss_monitor.cmd_topic_set_enabled(arg, True)
                     if ok:
                         _send_telegram_message(api_base, chat_id, f"🟢 Thema `{arg}` wurde aktiviert.")
                     else:
                         _send_telegram_message(api_base, chat_id, f"❌ Thema `{arg}` nicht gefunden.")
+                    count += 1
                     continue
 
                 elif subcmd in ("aus", "off", "disable", "deaktivieren"):
                     if not arg:
                         _send_telegram_message(api_base, chat_id, "Bitte Themen-ID angeben, z. B. `/themen aus parkinson`.")
+                        count += 1
                         continue
                     ok = rss_monitor.cmd_topic_set_enabled(arg, False)
                     if ok:
                         _send_telegram_message(api_base, chat_id, f"⚪ Thema `{arg}` wurde deaktiviert.")
                     else:
                         _send_telegram_message(api_base, chat_id, f"❌ Thema `{arg}` nicht gefunden.")
+                    count += 1
                     continue
 
                 elif subcmd in ("neu", "add", "anlegen"):
                     new_name = arg or (parts[1] if len(parts) > 1 and parts[1] not in ("neu", "add") else "")
                     if not new_name:
                         _send_telegram_message(api_base, chat_id, "Bitte Namen des neuen Themas angeben, z. B. `/themen neu Multiple Sklerose`.")
+                        count += 1
                         continue
                     _send_telegram_message(api_base, chat_id, f"⏳ Generiere Feeds & Kriterien für „{new_name}“ per KI...")
                     import argparse as _ap
@@ -2201,6 +2255,7 @@ def process_telegram_updates(
                         _send_telegram_message(api_base, chat_id, f"✅ Thema **{new_name}** wurde mit KI-generierten Quellen erfolgreich angelegt und aktiviert!")
                     else:
                         _send_telegram_message(api_base, chat_id, f"❌ Konnte Thema **{new_name}** nicht anlegen.")
+                    count += 1
                     continue
 
                 elif subcmd in ("run", "sync", "start"):
@@ -2214,13 +2269,16 @@ def process_telegram_updates(
                         except Exception as _e:
                             print(f"[RSS Telegram Run Error] {_e}")
                     threading.Thread(target=_async_rss, daemon=True).start()
+                    count += 1
                     continue
 
                 else:
                     _send_telegram_message(api_base, chat_id, "Unbekannter Befehl. Nutze `/themen` für die Übersicht.")
+                    count += 1
                     continue
             except Exception as exc:
                 _send_telegram_message(api_base, chat_id, f"Fehler bei /themen: {exc}")
+                count += 1
                 continue
 
         # 3. Harte Loop-Bremse & Token-Budget für den Chat-Turn
@@ -2638,18 +2696,35 @@ WICHTIG: Erstelle daraus KEINE neue Aufgabe in Notion Tasks."""
     return count
 
 
-def _send_telegram_message(api_base: str, chat_id: str, text: str) -> None:
-    try:
-        payload = json.dumps({"chat_id": chat_id, "text": text}).encode("utf-8")
-        req = request.Request(
-            f"{api_base}/sendMessage",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        request.urlopen(req, timeout=10).read()
-    except Exception:
-        pass
+def _send_telegram_message(api_base: str, chat_id: str, text: str) -> bool:
+    """Sendet Nachricht an Telegram. Teilt Texte > 3900 Zeichen automatisch in Chunks und loggt Fehler."""
+    if not api_base or not chat_id or not text:
+        return False
+    success = True
+    for i in range(0, len(text), 3900):
+        chunk = text[i:i + 3900]
+        try:
+            payload = json.dumps({"chat_id": chat_id, "text": chunk}).encode("utf-8")
+            req = request.Request(
+                f"{api_base}/sendMessage",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with request.urlopen(req, timeout=15) as resp:
+                if resp.status != 200:
+                    success = False
+        except error.HTTPError as he:
+            try:
+                err_body = he.read().decode("utf-8", errors="replace")
+            except Exception:
+                err_body = str(he.reason)
+            print(f"[Telegram Fehler] HTTP {he.code} an {chat_id}: {err_body}")
+            success = False
+        except Exception as exc:
+            print(f"[Telegram Fehler] Senden an {chat_id} fehlgeschlagen: {exc}")
+            success = False
+    return success
 
 
 def process_notion_inbox(
@@ -2825,14 +2900,37 @@ def generate_briefing(
         )
 
     if send_telegram:
-        bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-        chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip() or str(state.get("last_telegram_chat_id", "")).strip()
+        bot_token = (
+            os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+            or os.environ.get("TELEGRAM_RSSBOT_TOKEN", "").strip()
+        )
+        chat_id = (
+            os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+            or os.environ.get("TELEGRAM_RSS_CHAT_ID", "").strip()
+            or str(state.get("last_telegram_chat_id", "")).strip()
+        )
+        if not chat_id:
+            rss_state_file = BASE_DIR / "rss_state.json"
+            if rss_state_file.exists():
+                try:
+                    r_st = json.loads(rss_state_file.read_text(encoding="utf-8"))
+                    chat_id = str(r_st.get("last_rss_chat_id", "")).strip()
+                except Exception:
+                    pass
+        if not chat_id:
+            allowed = os.environ.get("TELEGRAM_ALLOWED_USERS", "").strip()
+            if allowed and (allowed.isdigit() or (allowed.startswith("-") and allowed[1:].isdigit())):
+                chat_id = allowed
+
         if bot_token and chat_id:
             api_base = f"https://api.telegram.org/bot{bot_token}"
-            _send_telegram_message(api_base, chat_id, text)
-            print(f"[Telegram] {mode.capitalize()}-Briefing an Chat-ID {chat_id} gesendet.")
+            ok = _send_telegram_message(api_base, chat_id, text)
+            if ok:
+                print(f"[Telegram] {mode.capitalize()}-Briefing an Chat-ID {chat_id} gesendet.")
+            else:
+                print(f"[Telegram Fehler] {mode.capitalize()}-Briefing an Chat-ID {chat_id} konnte nicht übertragen werden.")
         else:
-            print("[Telegram] Hinweis: Für Telegram-Push bitte TELEGRAM_BOT_TOKEN in .env setzen und dem Bot einmal /start schreiben.")
+            print(f"[Telegram] Hinweis: Bot-Token ({bool(bot_token)}) oder Chat-ID ({bool(chat_id)}) fehlt. Briefing nicht per Telegram gesendet.")
 
     return text
 
@@ -2883,6 +2981,16 @@ def perform_self_update() -> tuple[bool, str]:
             else:
                 pip_note = f"\n⚠️ Warnung bei pip install: {pip_proc.stderr[:120]}"
 
+        # Falls heute das Morgen-Briefing noch nicht kam oder verpasst wurde,
+        # setzen wir den Status dafür in scheduler_state.json zurück, damit der Neustart es nachholt.
+        try:
+            if SCHEDULER_STATE_PATH.exists():
+                st_data = json.loads(SCHEDULER_STATE_PATH.read_text(encoding="utf-8"))
+                st_data.pop("briefing_morning", None)
+                SCHEDULER_STATE_PATH.write_text(json.dumps(st_data, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
         msg = (
             f"🔄 *Update erfolgreich heruntergeladen!*\n\n"
             f"📌 *Neuer Commit:*\n`{commit_info}`\n"
@@ -2924,7 +3032,7 @@ DEFAULT_SCHEDULE: dict[str, Any] = {
     "timezone": "Europe/Berlin",
     "jobs": [
         {"id": "rss_morning", "time": "07:30", "catchup_until": "18:00", "command": ["rss_monitor.py", "run"]},
-        {"id": "briefing_morning", "time": "08:00", "catchup_until": "12:00",
+        {"id": "briefing_morning", "time": "08:00", "catchup_until": "14:00",
          "command": ["assistant.py", "briefing", "--mode", "morning", "--telegram"]},
         {"id": "rss_evening", "time": "18:30", "catchup_until": "23:59", "command": ["rss_monitor.py", "run"]},
         {"id": "briefing_evening", "time": "19:30", "catchup_until": "23:59",
@@ -2960,22 +3068,31 @@ def _save_scheduler_state(sched_state: dict[str, Any]) -> None:
         print(f"[Scheduler] Konnte Zustand nicht speichern: {exc}")
 
 
-def run_scheduled_jobs(cfg: dict[str, Any], running: dict[str, Any]) -> None:
-    """Startet fällige Zeitplan-Jobs (RSS-Monitor, Morgen-/Abend-Briefing) als Subprozess.
+def run_scheduled_jobs(
+    cfg: dict[str, Any],
+    running: dict[str, Any],
+    state: dict[str, Any] | None = None,
+    notion: NotionClient | None = None,
+) -> None:
+    """Startet fällige Zeitplan-Jobs (RSS-Monitor, Morgen-/Abend-Briefing) im Hintergrund.
 
-    Ersetzt den Windows Task Scheduler, damit der Daemon auch unter Linux/GCP (systemd) alles selbst erledigt.
-    `running` hält laufende Prozesse (job_id -> Popen), damit nichts doppelt startet.
+    Ersetzt den Windows Task Scheduler, damit der Daemon auch unter Linux/GCP alles selbst erledigt.
+    `running` hält aktive Threads & Prozesse (job_id -> Thread/Popen), damit nichts doppelt startet.
     """
     schedule = {**DEFAULT_SCHEDULE, **(cfg.get("schedule") or {})}
     if not schedule.get("enabled", True):
         return
 
-    # Beendete Prozesse aufräumen
-    for job_id, proc in list(running.items()):
-        rc = proc.poll()
-        if rc is not None:
-            print(f"[Scheduler] Job '{job_id}' beendet (Exit-Code {rc}).")
-            running.pop(job_id, None)
+    # Beendete Threads & Prozesse aufräumen
+    for job_id, item in list(running.items()):
+        if isinstance(item, threading.Thread):
+            if not item.is_alive():
+                running.pop(job_id, None)
+        else:
+            rc = item.poll()
+            if rc is not None:
+                print(f"[Scheduler] Job '{job_id}' beendet (Exit-Code {rc}).")
+                running.pop(job_id, None)
 
     now = _scheduler_now(schedule.get("timezone", "Europe/Berlin"))
     today = now.date().isoformat()
@@ -2996,6 +3113,64 @@ def run_scheduled_jobs(cfg: dict[str, Any], running: dict[str, Any]) -> None:
         if not (start_t <= now.time().replace(tzinfo=None) <= until_t):
             continue
 
+        # A) Briefing-Jobs direkt im In-Memory-Thread des Daemons ausführen
+        # Nutzt aktiven Notion-Client, Kalender-Cache und verhindert Subprozess-Fehler
+        if "briefing" in job_id and state is not None:
+            mode = "evening" if "evening" in job_id else "morning"
+
+            def _briefing_worker(jid=job_id, m=mode, d=today):
+                try:
+                    print(f"[Scheduler] Starte Briefing-Job '{jid}' (Modus: {m})...")
+                    if notion:
+                        try:
+                            state["tasks"] = notion.query_open_tasks(cfg["notion"]["tasks_database_id"])
+                        except Exception as ne:
+                            print(f"[Scheduler Briefing] Notion-Refresh Hinweis: {ne}")
+                    text = generate_briefing(cfg, state, notify=False, mode=m, send_telegram=True)
+                    try:
+                        with open(SCHEDULER_LOG_PATH, "a", encoding="utf-8") as f:
+                            f.write(f"\n===== {_scheduler_now(schedule.get('timezone', 'Europe/Berlin')).isoformat(timespec='seconds')} Briefing '{jid}' gesendet =====\n")
+                            f.write(text[:300] + "...\n")
+                    except Exception:
+                        pass
+                    st = _load_scheduler_state()
+                    st[jid] = d
+                    _save_scheduler_state(st)
+                    print(f"[Scheduler] Briefing-Job '{jid}' erfolgreich abgeschlossen.")
+                except Exception as exc:
+                    print(f"[Scheduler Fehler] Briefing-Job '{jid}' fehlgeschlagen: {exc}")
+                    import traceback
+                    traceback.print_exc()
+
+            t = threading.Thread(target=_briefing_worker, daemon=True)
+            t.start()
+            running[job_id] = t
+            continue
+
+        # B) RSS-Monitor-Jobs im Thread ausführen
+        if "rss" in job_id:
+            def _rss_worker(jid=job_id, d=today):
+                try:
+                    print(f"[Scheduler] Starte RSS-Job '{jid}'...")
+                    import rss_monitor
+                    import argparse as _ap
+                    ns = _ap.Namespace(topic=None, dry_run=False, no_notify=False, no_notion=False, verbose=False)
+                    rss_monitor.run(ns)
+                    st = _load_scheduler_state()
+                    st[jid] = d
+                    _save_scheduler_state(st)
+                    print(f"[Scheduler] RSS-Job '{jid}' erfolgreich abgeschlossen.")
+                except Exception as exc:
+                    print(f"[Scheduler Fehler] RSS-Job '{jid}' fehlgeschlagen: {exc}")
+                    import traceback
+                    traceback.print_exc()
+
+            t = threading.Thread(target=_rss_worker, daemon=True)
+            t.start()
+            running[job_id] = t
+            continue
+
+        # C) Generischer Fallback für sonstige externe Befehle als Subprozess
         cmd = [sys.executable] + [str(BASE_DIR / job["command"][0])] + list(job["command"][1:])
         try:
             log_fh = open(SCHEDULER_LOG_PATH, "a", encoding="utf-8")
@@ -3005,11 +3180,10 @@ def run_scheduled_jobs(cfg: dict[str, Any], running: dict[str, Any]) -> None:
             log_fh.close()
             running[job_id] = proc
             print(f"[Scheduler] Job '{job_id}' gestartet (PID {proc.pid}).")
+            sched_state[job_id] = today
+            _save_scheduler_state(sched_state)
         except Exception as exc:
             print(f"[Scheduler] Job '{job_id}' konnte nicht gestartet werden: {exc}")
-        # Auch bei Fehlschlag als erledigt markieren, um Endlos-Neustarts zu vermeiden
-        sched_state[job_id] = today
-        _save_scheduler_state(sched_state)
 
 
 def run_daemon(
@@ -3076,7 +3250,7 @@ def run_daemon(
 
             # Zeitplan: RSS 07:30/18:30, Briefing 08:00/19:30 (Europe/Berlin), holt verpasste Läufe nach
             try:
-                run_scheduled_jobs(cfg, scheduled_procs)
+                run_scheduled_jobs(cfg, scheduled_procs, state=state, notion=notion)
             except Exception as exc:
                 print(f"[Scheduler Hinweis] {exc}")
 
