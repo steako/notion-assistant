@@ -30,6 +30,9 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
+import traceback
 from pathlib import Path
 from typing import Any
 from urllib import error, request
@@ -2981,12 +2984,13 @@ def perform_self_update() -> tuple[bool, str]:
             else:
                 pip_note = f"\n⚠️ Warnung bei pip install: {pip_proc.stderr[:120]}"
 
-        # Falls heute das Morgen-Briefing noch nicht kam oder verpasst wurde,
+        # Falls heute das Morgen- oder Abend-Briefing noch nicht kam oder verpasst wurde,
         # setzen wir den Status dafür in scheduler_state.json zurück, damit der Neustart es nachholt.
         try:
             if SCHEDULER_STATE_PATH.exists():
                 st_data = json.loads(SCHEDULER_STATE_PATH.read_text(encoding="utf-8"))
                 st_data.pop("briefing_morning", None)
+                st_data.pop("briefing_evening", None)
                 SCHEDULER_STATE_PATH.write_text(json.dumps(st_data, indent=2), encoding="utf-8")
         except Exception:
             pass
@@ -3006,7 +3010,6 @@ def trigger_restart() -> None:
     """Startet den Prozess sauber neu.
     Funktioniert unter systemd (Restart=always) und direkt via os.execv / sys.exit.
     """
-    import threading
     def _restart():
         time.sleep(1.5)
         pid_file = BASE_DIR / "daemon.pid"
@@ -3014,9 +3017,13 @@ def trigger_restart() -> None:
             pid_file.unlink(missing_ok=True)
         except Exception:
             pass
+        script = str(BASE_DIR / "assistant.py")
+        cmd_args = [sys.executable, script] + [a for a in sys.argv[1:] if a != script]
         try:
-            os.execv(sys.executable, [sys.executable] + sys.argv)
-        except Exception:
+            print(f"[Restart] Führe execv aus: {' '.join(cmd_args)}")
+            os.execv(sys.executable, cmd_args)
+        except Exception as exc:
+            print(f"[Restart Fehler] execv fehlgeschlagen: {exc} -> Beende Prozess für externen Restart.")
             os._exit(0)
 
     threading.Thread(target=_restart, daemon=True).start()
