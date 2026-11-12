@@ -37,8 +37,25 @@ from typing import Any
 import urllib.error
 import urllib.request
 
-import feedparser  # type: ignore
-import requests
+try:
+    import feedparser  # type: ignore
+except ImportError:
+    try:
+        import subprocess
+        subprocess.run([sys.executable, "-m", "pip", "install", "feedparser", "-q"], timeout=60)
+        import feedparser  # type: ignore
+    except Exception:
+        feedparser = None
+
+try:
+    import requests
+except ImportError:
+    try:
+        import subprocess
+        subprocess.run([sys.executable, "-m", "pip", "install", "requests", "-q"], timeout=60)
+        import requests
+    except Exception:
+        requests = None
 
 import assistant  # bestehender Assistent: Config/.env, NotionClient, LLM-Auswahl, Benachrichtigungen
 import jev_client
@@ -163,12 +180,85 @@ def release_lock() -> None:
 _feed_cache: dict[str, list[dict[str, Any]]] = {}
 
 
+def _http_get_bytes(url: str, timeout: int = 30) -> bytes:
+    """Ruft eine URL über requests oder das native urllib.request ab."""
+    if requests is not None:
+        resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=timeout)
+        resp.raise_for_status()
+        return resp.content
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def _parse_feed(content: bytes) -> Any:
+    """Parst RSS/Atom entweder per feedparser oder per nativem ElementTree XML-Fallback."""
+    if feedparser is not None:
+        return feedparser.parse(content)
+
+    import xml.etree.ElementTree as ET
+    import email.utils
+
+    class _Entry:
+        def __init__(self, title: str, link: str, summary: str, published_parsed: Any = None, src_name: str | None = None):
+            self.title = title
+            self.link = link
+            self.summary = summary
+            self.published_parsed = published_parsed
+            self.updated_parsed = published_parsed
+            self.source = {"title": src_name} if src_name else {}
+
+        def get(self, k: str, default: Any = None) -> Any:
+            return getattr(self, k, default)
+
+    class _Feed:
+        def __init__(self, entries: list[Any]):
+            self.entries = entries
+
+    entries: list[Any] = []
+    try:
+        root = ET.fromstring(content)
+        # 1. RSS 2.0 (<channel><item>...)
+        for item in root.findall(".//item"):
+            t = (item.findtext("title") or "").strip()
+            l = (item.findtext("link") or "").strip()
+            s = (item.findtext("description") or item.findtext("{http://purl.org/rss/1.0/modules/content/}encoded") or "").strip()
+            src = (item.findtext("source") or "").strip()
+            pub = item.findtext("pubDate") or item.findtext("{http://purl.org/dc/elements/1.1/}date")
+            ts = None
+            if pub:
+                try:
+                    ts = email.utils.parsedate(pub)
+                except Exception:
+                    pass
+            entries.append(_Entry(t, l, s, published_parsed=ts, src_name=src))
+
+        # 2. Atom (<feed><entry>...)
+        if not entries:
+            for entry in root.findall(".//{http://www.w3.org/2005/Atom}entry") or root.findall(".//entry"):
+                t = (entry.findtext("{http://www.w3.org/2005/Atom}title") or entry.findtext("title") or "").strip()
+                l_el = entry.find("{http://www.w3.org/2005/Atom}link") or entry.find("link")
+                l = l_el.get("href", "") if l_el is not None else ""
+                s = (entry.findtext("{http://www.w3.org/2005/Atom}summary") or entry.findtext("{http://www.w3.org/2005/Atom}content") or entry.findtext("summary") or "").strip()
+                upd = entry.findtext("{http://www.w3.org/2005/Atom}updated") or entry.findtext("{http://www.w3.org/2005/Atom}published")
+                ts = None
+                if upd:
+                    try:
+                        clean_dt = upd.replace("Z", "+00:00")
+                        ts = dt.datetime.fromisoformat(clean_dt).timetuple()
+                    except Exception:
+                        pass
+                entries.append(_Entry(t, l, s, published_parsed=ts))
+    except Exception as exc:
+        log.warning("XML Fallback Parser Fehler: %s", exc)
+    return _Feed(entries)
+
+
 def fetch_rss(source: dict[str, Any], max_age_days: int, max_items: int) -> list[dict[str, Any]]:
     url = source["url"]
     if url not in _feed_cache:
-        resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=30)
-        resp.raise_for_status()
-        parsed = feedparser.parse(resp.content)
+        content = _http_get_bytes(url, timeout=30)
+        parsed = _parse_feed(content)
         entries = []
         for e in parsed.entries:
             ts = e.get("published_parsed") or e.get("updated_parsed")
