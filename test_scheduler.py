@@ -129,3 +129,19 @@ def test_process_telegram_status_command():
         # Intent Router darf für /status NIEMALS aufgerufen werden!
         mock_classify.assert_not_called()
 
+
+def test_rss_bot_handle_status_without_rss_monitor():
+    """Stellt sicher, dass rss_bot.handle_status auch funktioniert, wenn rss_monitor None ist."""
+    import rss_bot
+    with patch.object(rss_bot, "rss_monitor", None), \
+         patch.object(rss_bot, "query_notion_knowledge", return_value=[]), \
+         patch.object(rss_bot, "load_rss_state", return_value={"seen": {}}):
+
+        status_msg = rss_bot.handle_status("12345")
+        assert "Wissensspeicher- & RSS-Status" in status_msg
+        assert "Fehler: rss_monitor nicht geladen" not in status_msg
+
+        themen_msg = rss_bot.handle_themen("12345")
+        assert "Konfigurierte Themengebiete" in themen_msg
+
+

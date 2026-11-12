@@ -27,17 +27,21 @@ from pathlib import Path
 from typing import Any
 
 BASE_DIR = Path(__file__).resolve().parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
 
 # Lokale Module einbinden
 try:
     import assistant
-except ImportError:
+except Exception:
     assistant = None
 
+_rss_monitor_import_error: str | None = None
 try:
     import rss_monitor
-except ImportError:
+except Exception as _r_err:
     rss_monitor = None
+    _rss_monitor_import_error = str(_r_err)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -124,6 +128,21 @@ def send_message(token: str, chat_id: str, text: str, parse_mode: str | None = N
     return success
 
 
+def load_feeds_config() -> dict[str, Any]:
+    """Lädt die Themen-Konfiguration robust (über rss_monitor oder direkt aus feeds.json)."""
+    if rss_monitor is not None and hasattr(rss_monitor, "load_feeds_config"):
+        try:
+            return rss_monitor.load_feeds_config()
+        except Exception:
+            pass
+    if FEEDS_CONFIG_PATH.exists():
+        try:
+            return json.loads(FEEDS_CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {"topics": []}
+
+
 # --------------------------------------------------------------------------------------
 # Notion-Abfragen für den Wissensspeicher
 # --------------------------------------------------------------------------------------
@@ -131,10 +150,10 @@ def send_message(token: str, chat_id: str, text: str, parse_mode: str | None = N
 def query_notion_knowledge(filter_payload: dict[str, Any] | None = None, page_size: int = 5) -> list[dict[str, Any]]:
     """Fragt die Wissensspeicher-Datenbank in Notion ab."""
     token = os.environ.get("NOTION_TOKEN", "").strip()
-    if not token or rss_monitor is None:
+    if not token:
         return []
     
-    feeds_cfg = rss_monitor.load_feeds_config()
+    feeds_cfg = load_feeds_config()
     db_id = feeds_cfg.get("notion_database_id", "c7bac0f9-b222-4aa6-a0b4-2510fb987b7b").replace("-", "")
     
     payload: dict[str, Any] = {"page_size": page_size}
@@ -227,9 +246,7 @@ def handle_start_or_help(chat_id: str) -> str:
 
 
 def handle_themen(chat_id: str) -> str:
-    if rss_monitor is None:
-        return "Fehler: rss_monitor Modul nicht geladen."
-    cfg = rss_monitor.load_feeds_config()
+    cfg = load_feeds_config()
     topics = cfg.get("topics", [])
     if not topics:
         return "Keine Themen in feeds.json konfiguriert."
@@ -261,9 +278,21 @@ def handle_themen(chat_id: str) -> str:
 def handle_toggle(chat_id: str, topic_id: str, enable: bool) -> str:
     if not topic_id.strip():
         return f"Bitte Themen-ID angeben, z. B. `/{'an' if enable else 'aus'} parkinson`."
-    if rss_monitor is None:
-        return "Fehler: rss_monitor nicht verfügbar."
-    ok = rss_monitor.cmd_topic_set_enabled(topic_id.strip(), enable)
+    if rss_monitor is not None and hasattr(rss_monitor, "cmd_topic_set_enabled"):
+        ok = rss_monitor.cmd_topic_set_enabled(topic_id.strip(), enable)
+    else:
+        cfg = load_feeds_config()
+        ok = False
+        for t in cfg.get("topics", []):
+            if t.get("id") == topic_id.strip():
+                t["enabled"] = enable
+                ok = True
+                break
+        if ok:
+            try:
+                FEEDS_CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+            except Exception:
+                ok = False
     if ok:
         status_str = "aktiviert 🟢" if enable else "pausiert ⚪"
         return f"Thema `{topic_id}` wurde {status_str}."
@@ -303,7 +332,14 @@ def handle_loeschen(chat_id: str, topic_id: str) -> str:
 def handle_run_async(chat_id: str, token: str) -> None:
     """Führt rss_monitor.run() in einem separaten Thread aus."""
     if rss_monitor is None:
-        send_message(token, chat_id, "Fehler: rss_monitor nicht verfügbar.")
+        err_msg = f" ({_rss_monitor_import_error})" if _rss_monitor_import_error else ""
+        send_message(
+            token,
+            chat_id,
+            f"❌ Fehler: rss_monitor nicht verfügbar{err_msg}.\n\n"
+            f"💡 Tipp: Bitte auf dem GCP-Server Abhängigkeiten installieren:\n"
+            f"`pip install -r requirements.txt`",
+        )
         return
 
     # Lock prüfen (LOCK_PATH oder LOCK_FILE)
@@ -397,10 +433,7 @@ def handle_suche(chat_id: str, query: str) -> str:
 
 def handle_status(chat_id: str) -> str:
     """Gibt Systemstatus, Anzahl Einträge und Zeitpläne aus."""
-    if rss_monitor is None:
-        return "Fehler: rss_monitor nicht geladen."
-    
-    cfg = rss_monitor.load_feeds_config()
+    cfg = load_feeds_config()
     topics = cfg.get("topics", [])
     active_cnt = sum(1 for t in topics if t.get("enabled", True))
     paused_cnt = len(topics) - active_cnt
@@ -450,6 +483,13 @@ def handle_status(chat_id: str) -> str:
             "⏰ *Automatischer Zeitplan (im Daemon integriert, Europe/Berlin):*",
             "• Morgens: *07:30 Uhr* (RSS) | *08:00 Uhr* (Briefing)",
             "• Abends: *18:30 Uhr* (RSS) | *19:30 Uhr* (Briefing)",
+        ])
+
+    if _rss_monitor_import_error:
+        lines.extend([
+            "",
+            f"⚠️ _Hinweis: rss_monitor Modul: {_rss_monitor_import_error}_",
+            "_(Tipp: Auf dem Server `pip install -r requirements.txt` ausführen)_",
         ])
 
     lines.extend([
