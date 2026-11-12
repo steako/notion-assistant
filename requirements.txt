@@ -2,5 +2,6 @@ requests>=2.31.0
 python-dotenv>=1.0.0
 google-genai>=0.1.0
 feedparser>=6.0.0
+tzdata>=2024.1
 win11toast>=0.34; sys_platform == 'win32'
 pytest>=8.0.0

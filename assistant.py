@@ -2102,10 +2102,15 @@ def process_telegram_updates(
                 # Nächsten Lauf exakt berechnen
                 try:
                     start_t = _parse_hhmm(jtime)
-                    if not already_ran_today and now_t < start_t:
-                        next_run_str = f"Heute, {jtime} Uhr"
-                    else:
+                    until_t = _parse_hhmm(j.get("catchup_until", "23:59"))
+                    if already_ran_today:
                         next_run_str = f"Morgen, {jtime} Uhr"
+                    elif now_t < start_t:
+                        next_run_str = f"Heute, {jtime} Uhr"
+                    elif start_t <= now_t <= until_t:
+                        next_run_str = f"Heute fällig (Zeitfenster aktiv bis {j.get('catchup_until', '23:59')} Uhr)"
+                    else:
+                        next_run_str = f"Morgen, {jtime} Uhr (heute verpasst nach {j.get('catchup_until', '23:59')} Uhr)"
                 except Exception:
                     next_run_str = f"Geplant um {jtime} Uhr"
 
@@ -3003,6 +3008,7 @@ def generate_briefing(
     notify: bool = False,
     mode: str = "morning",
     send_telegram: bool = False,
+    raise_on_telegram_failure: bool = False,
 ) -> str:
     today_iso = dt.date.today().isoformat()
     open_todos = [t for t in state.get("tasks", []) if t.get("kind") == "To-Do" and t.get("status") != "Erledigt"]
@@ -3093,7 +3099,16 @@ def generate_briefing(
 
     text = "\n".join(lines)
     if notify and (open_todos or suggestions or all_cal):
-        top_focus = (today_cal[0]["title"] if today_cal else (open_todos[0]["title"] if open_todos else suggestions[0]["title"]))
+        if today_cal:
+            top_focus = today_cal[0].get("title", "Termin")
+        elif open_todos:
+            top_focus = open_todos[0].get("title", "Aufgabe")
+        elif suggestions:
+            top_focus = suggestions[0].get("title", "Vorschlag")
+        elif all_cal:
+            top_focus = all_cal[0].get("title", "Termin")
+        else:
+            top_focus = "Fokus"
         show_windows_notification(
             header,
             f"{len(today_cal)} Termine heute, {len(open_todos)} To-Dos. Fokus: {top_focus}",
@@ -3128,9 +3143,15 @@ def generate_briefing(
             if ok:
                 print(f"[Telegram] {mode.capitalize()}-Briefing an Chat-ID {chat_id} gesendet.")
             else:
-                print(f"[Telegram Fehler] {mode.capitalize()}-Briefing an Chat-ID {chat_id} konnte nicht übertragen werden.")
+                err_msg = f"{mode.capitalize()}-Briefing an Chat-ID {chat_id} konnte nicht übertragen werden."
+                print(f"[Telegram Fehler] {err_msg}")
+                if raise_on_telegram_failure:
+                    raise RuntimeError(err_msg)
         else:
-            print(f"[Telegram] Hinweis: Bot-Token ({bool(bot_token)}) oder Chat-ID ({bool(chat_id)}) fehlt. Briefing nicht per Telegram gesendet.")
+            missing_info = f"Bot-Token ({bool(bot_token)}) oder Chat-ID ({bool(chat_id)}) fehlt."
+            print(f"[Telegram] Hinweis: {missing_info} Briefing nicht per Telegram gesendet.")
+            if raise_on_telegram_failure:
+                raise RuntimeError(missing_info)
 
     return text
 
@@ -3205,7 +3226,7 @@ def perform_self_update() -> tuple[bool, str]:
 
 def trigger_restart() -> None:
     """Startet den Prozess sauber neu.
-    Funktioniert unter systemd (Restart=always) und direkt via os.execv / sys.exit.
+    Funktioniert unter systemd (Restart=always), Windows Task Scheduler und direkt via subprocess / os.execv.
     """
     def _restart():
         time.sleep(1.5)
@@ -3217,10 +3238,14 @@ def trigger_restart() -> None:
         script = str(BASE_DIR / "assistant.py")
         cmd_args = [sys.executable, script] + [a for a in sys.argv[1:] if a != script]
         try:
-            print(f"[Restart] Führe execv aus: {' '.join(cmd_args)}")
-            os.execv(sys.executable, cmd_args)
+            print(f"[Restart] Führe Neustart aus: {' '.join(cmd_args)}")
+            if sys.platform == "win32":
+                subprocess.Popen(cmd_args, cwd=BASE_DIR, close_fds=True)
+                os._exit(0)
+            else:
+                os.execv(sys.executable, cmd_args)
         except Exception as exc:
-            print(f"[Restart Fehler] execv fehlgeschlagen: {exc} -> Beende Prozess für externen Restart.")
+            print(f"[Restart Fehler] Neustart fehlgeschlagen: {exc} -> Beende Prozess für externen Restart.")
             os._exit(0)
 
     threading.Thread(target=_restart, daemon=True).start()
@@ -3228,6 +3253,7 @@ def trigger_restart() -> None:
 
 SCHEDULER_STATE_PATH = BASE_DIR / "scheduler_state.json"
 SCHEDULER_LOG_PATH = BASE_DIR / "scheduler.log"
+SCHEDULER_RETRY_COOLDOWN: dict[str, float] = {}
 
 # Standard-Zeitplan (überschreibbar via config.json -> "schedule").
 # "catchup_until": Bis zu dieser Uhrzeit wird ein verpasster Lauf (z. B. nach Neustart) noch nachgeholt.
@@ -3236,7 +3262,7 @@ DEFAULT_SCHEDULE: dict[str, Any] = {
     "timezone": "Europe/Berlin",
     "jobs": [
         {"id": "rss_morning", "time": "07:30", "catchup_until": "18:00", "command": ["rss_monitor.py", "run"]},
-        {"id": "briefing_morning", "time": "08:00", "catchup_until": "14:00",
+        {"id": "briefing_morning", "time": "08:00", "catchup_until": "17:00",
          "command": ["assistant.py", "briefing", "--mode", "morning", "--telegram"]},
         {"id": "rss_evening", "time": "18:30", "catchup_until": "23:59", "command": ["rss_monitor.py", "run"]},
         {"id": "briefing_evening", "time": "19:30", "catchup_until": "23:59",
@@ -3306,6 +3332,8 @@ def run_scheduled_jobs(
         job_id = job.get("id")
         if not job_id or job.get("enabled", True) is False or job_id in running:
             continue
+        if SCHEDULER_RETRY_COOLDOWN.get(job_id, 0) > time.time():
+            continue
         if sched_state.get(job_id) == today:
             continue
         try:
@@ -3330,7 +3358,7 @@ def run_scheduled_jobs(
                             state["tasks"] = notion.query_open_tasks(cfg["notion"]["tasks_database_id"])
                         except Exception as ne:
                             print(f"[Scheduler Briefing] Notion-Refresh Hinweis: {ne}")
-                    text = generate_briefing(cfg, state, notify=False, mode=m, send_telegram=True)
+                    text = generate_briefing(cfg, state, notify=False, mode=m, send_telegram=True, raise_on_telegram_failure=True)
                     try:
                         with open(SCHEDULER_LOG_PATH, "a", encoding="utf-8") as f:
                             f.write(f"\n===== {_scheduler_now(schedule.get('timezone', 'Europe/Berlin')).isoformat(timespec='seconds')} Briefing '{jid}' gesendet =====\n")
@@ -3340,9 +3368,11 @@ def run_scheduled_jobs(
                     st = _load_scheduler_state()
                     st[jid] = d
                     _save_scheduler_state(st)
+                    SCHEDULER_RETRY_COOLDOWN.pop(jid, None)
                     print(f"[Scheduler] Briefing-Job '{jid}' erfolgreich abgeschlossen.")
                 except Exception as exc:
-                    print(f"[Scheduler Fehler] Briefing-Job '{jid}' fehlgeschlagen: {exc}")
+                    SCHEDULER_RETRY_COOLDOWN[jid] = time.time() + 300
+                    print(f"[Scheduler Fehler] Briefing-Job '{jid}' fehlgeschlagen (erneuter Versuch in 5 Min.): {exc}")
                     import traceback
                     traceback.print_exc()
 
@@ -3363,9 +3393,11 @@ def run_scheduled_jobs(
                     st = _load_scheduler_state()
                     st[jid] = d
                     _save_scheduler_state(st)
+                    SCHEDULER_RETRY_COOLDOWN.pop(jid, None)
                     print(f"[Scheduler] RSS-Job '{jid}' erfolgreich abgeschlossen.")
                 except Exception as exc:
-                    print(f"[Scheduler Fehler] RSS-Job '{jid}' fehlgeschlagen: {exc}")
+                    SCHEDULER_RETRY_COOLDOWN[jid] = time.time() + 300
+                    print(f"[Scheduler Fehler] RSS-Job '{jid}' fehlgeschlagen (erneuter Versuch in 5 Min.): {exc}")
                     import traceback
                     traceback.print_exc()
 
