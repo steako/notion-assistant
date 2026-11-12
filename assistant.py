@@ -3191,12 +3191,23 @@ def perform_self_update() -> tuple[bool, str]:
     import subprocess
     try:
         pull_proc = subprocess.run(
-            ["git", "pull"],
+            ["git", "pull", "--autostash"],
             cwd=BASE_DIR,
             capture_output=True,
             text=True,
             timeout=60,
         )
+        if pull_proc.returncode != 0:
+            # Fallback mit explizitem stash
+            subprocess.run(["git", "stash"], cwd=BASE_DIR, capture_output=True, timeout=15)
+            pull_proc = subprocess.run(
+                ["git", "pull"],
+                cwd=BASE_DIR,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
         if pull_proc.returncode != 0:
             err = pull_proc.stderr.strip() or pull_proc.stdout.strip()
             return False, f"❌ `git pull` fehlgeschlagen:\n```\n{err}\n```"
@@ -3268,8 +3279,11 @@ def trigger_restart() -> None:
             pid_file.unlink(missing_ok=True)
         except Exception:
             pass
-        script = str(BASE_DIR / "assistant.py")
+        script_name = Path(sys.argv[0]).name if sys.argv and Path(sys.argv[0]).name.endswith(".py") else "assistant.py"
+        script = str(BASE_DIR / script_name)
         cmd_args = [sys.executable, script] + [a for a in sys.argv[1:] if a != script]
+        if script_name == "assistant.py" and "daemon" not in cmd_args and "run" not in cmd_args and "briefing" not in cmd_args:
+            cmd_args.append("daemon")
         try:
             print(f"[Restart] Führe Neustart aus: {' '.join(cmd_args)}")
             if os.environ.get("INVOCATION_ID") or os.environ.get("JOURNAL_STREAM"):

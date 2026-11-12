@@ -421,13 +421,41 @@ def handle_status(chat_id: str) -> str:
         f"• Themen: *{active_cnt} aktiv*, {paused_cnt} pausiert",
         f"• Gesehene Artikel im Cache: *{seen_cnt}*",
         f"• Letzter Notion-Eintrag: *{last_entry}*",
-        "",
-        "⏰ *Automatischer Zeitplan (im Daemon integriert, Europe/Berlin):*",
-        "• Morgens: *07:30 Uhr*",
-        "• Abends: *18:30 Uhr*",
+    ]
+
+    sched_lines = []
+    if assistant is not None:
+        try:
+            sched_st = assistant._load_scheduler_state()
+            now_berlin = assistant._scheduler_now("Europe/Berlin")
+            time_str = now_berlin.strftime("%H:%M Uhr (%d.%m.%Y)")
+            sched_lines.append(f"🕒 *Serverzeit (Berlin):* {time_str}")
+            job_names = {
+                "rss_morning": "📰 RSS-Monitor Morgen (07:30 Uhr)",
+                "briefing_morning": "☀️ Morgen-Briefing (08:00 Uhr)",
+                "rss_evening": "📰 RSS-Monitor Abend (18:30 Uhr)",
+                "briefing_evening": "🌙 Abend-Briefing (19:30 Uhr)",
+            }
+            for jid, jlabel in job_names.items():
+                last = sched_st.get(jid, "noch nicht gelaufen")
+                sched_lines.append(f"• *{jlabel}*\n   ↳ Zuletzt: `{last}`")
+        except Exception:
+            pass
+
+    if sched_lines:
+        lines.extend(["", "⏰ *Automatischer Zeitplan & Status:*"] + sched_lines)
+    else:
+        lines.extend([
+            "",
+            "⏰ *Automatischer Zeitplan (im Daemon integriert, Europe/Berlin):*",
+            "• Morgens: *07:30 Uhr* (RSS) | *08:00 Uhr* (Briefing)",
+            "• Abends: *18:30 Uhr* (RSS) | *19:30 Uhr* (Briefing)",
+        ])
+
+    lines.extend([
         "",
         "🔗 [Wissensspeicher in Notion öffnen](https://app.notion.com/p/c7bac0f9b2224aa6a0b42510fb987b7b)",
-    ]
+    ])
     return "\n".join(lines)
 
 
