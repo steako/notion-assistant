@@ -75,3 +75,57 @@ def test_scheduler_retry_cooldown_on_failure():
         # Cooldown muss aktiv sein
         assert "briefing_morning" in assistant.SCHEDULER_RETRY_COOLDOWN
         assert assistant.SCHEDULER_RETRY_COOLDOWN["briefing_morning"] > time.time()
+
+
+def test_perform_self_update_restarts_when_already_up_to_date():
+    """Prüft, dass perform_self_update auch bei 'Already up to date' needs_restart=True zurückgibt."""
+    import subprocess
+    proc_mock = MagicMock()
+    proc_mock.returncode = 0
+    proc_mock.stdout = "Already up to date."
+    proc_mock.stderr = ""
+
+    with patch("subprocess.run", return_value=proc_mock):
+        needs_restart, msg = assistant.perform_self_update()
+        assert needs_restart is True
+        assert "bereits auf dem neuesten Stand" in msg
+        assert "Starte Dienst neu" in msg
+
+
+def test_process_telegram_status_command():
+    """Prüft, dass /status direkt den Assistenten-Statusblock sendet und nicht an den Chat-Router fällt."""
+    cfg = assistant.load_config()
+    state = {"tasks": [], "items": [], "calendar_events": []}
+    mock_updates = {
+        "ok": True,
+        "result": [
+            {
+                "update_id": 999,
+                "message": {
+                    "chat": {"id": 12345},
+                    "text": "/status",
+                }
+            }
+        ]
+    }
+
+    with patch("assistant.load_config", return_value=cfg), \
+         patch("assistant.save_local_state"), \
+         patch("assistant._send_telegram_message") as mock_send, \
+         patch("assistant.classify_intent") as mock_classify:
+
+        with patch.dict("os.environ", {"TELEGRAM_BOT_TOKEN": "mock_token", "TELEGRAM_ALLOWED_USERS": "12345"}):
+            with patch("urllib.request.urlopen") as mock_url:
+                import io, json
+                mock_resp = io.BytesIO(json.dumps(mock_updates).encode("utf-8"))
+                mock_url.return_value.__enter__.return_value.read.return_value = mock_resp.getvalue()
+                mock_url.return_value.__enter__.return_value.status = 200
+
+                assistant.process_telegram_updates(cfg, state, notion=None)
+
+        mock_send.assert_called_once()
+        sent_text = mock_send.call_args[0][2]
+        assert "Assistent & Scheduler Status" in sent_text
+        # Intent Router darf für /status NIEMALS aufgerufen werden!
+        mock_classify.assert_not_called()
+

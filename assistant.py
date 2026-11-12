@@ -2079,83 +2079,92 @@ def process_telegram_updates(
 
         # 2. Direkte Bot-Kommandos (Schnellzugriff)
         if cmd_lower in ("status", "dienst", "info", "zeitplan", "schedule", "läufe", "laeufe") or cmd_lower.startswith(("/status", "/dienst", "/info", "/zeitplan", "/schedule", "status ", "zeitplan ")):
-            sched_state = _load_scheduler_state()
-            now_berlin = _scheduler_now("Europe/Berlin")
-            time_str = now_berlin.strftime("%H:%M Uhr (%d.%m.%Y)")
-            today_str = now_berlin.date().isoformat()
-            now_t = now_berlin.time().replace(tzinfo=None)
-            sched_cfg = {**DEFAULT_SCHEDULE, **(cfg.get("schedule") or {})}
-            job_lines = []
-            job_names = {
-                "rss_morning": "📰 RSS-Monitor Morgen",
-                "briefing_morning": "☀️ Morgen-Briefing",
-                "rss_evening": "📰 RSS-Monitor Abend",
-                "briefing_evening": "🌙 Abend-Briefing",
-            }
-            for j in sched_cfg.get("jobs", []):
-                jid = j.get("id", "")
-                jtime = j.get("time", "")
-                j_name = job_names.get(jid, f"📌 {jid}")
-                last_run = sched_state.get(jid)
-                already_ran_today = (last_run == today_str)
+            try:
+                sched_state = _load_scheduler_state()
+                now_berlin = _scheduler_now("Europe/Berlin")
+                time_str = now_berlin.strftime("%H:%M Uhr (%d.%m.%Y)")
+                today_str = now_berlin.date().isoformat()
+                now_t = now_berlin.time().replace(tzinfo=None)
+                sched_cfg = {**DEFAULT_SCHEDULE, **(cfg.get("schedule") or {})}
+                job_lines = []
+                job_names = {
+                    "rss_morning": "📰 RSS-Monitor Morgen",
+                    "briefing_morning": "☀️ Morgen-Briefing",
+                    "rss_evening": "📰 RSS-Monitor Abend",
+                    "briefing_evening": "🌙 Abend-Briefing",
+                }
+                for j in sched_cfg.get("jobs", []):
+                    jid = j.get("id", "")
+                    jtime = j.get("time", "")
+                    j_name = job_names.get(jid, f"📌 {jid}")
+                    last_run = sched_state.get(jid)
+                    already_ran_today = (last_run == today_str)
 
-                # Nächsten Lauf exakt berechnen
-                try:
-                    start_t = _parse_hhmm(jtime)
-                    until_t = _parse_hhmm(j.get("catchup_until", "23:59"))
+                    # Nächsten Lauf exakt berechnen
+                    try:
+                        start_t = _parse_hhmm(jtime)
+                        until_t = _parse_hhmm(j.get("catchup_until", "23:59"))
+                        if already_ran_today:
+                            next_run_str = f"Morgen, {jtime} Uhr"
+                        elif now_t < start_t:
+                            next_run_str = f"Heute, {jtime} Uhr"
+                        elif start_t <= now_t <= until_t:
+                            next_run_str = f"Heute fällig (Zeitfenster aktiv bis {j.get('catchup_until', '23:59')} Uhr)"
+                        else:
+                            next_run_str = f"Morgen, {jtime} Uhr (heute verpasst nach {j.get('catchup_until', '23:59')} Uhr)"
+                    except Exception:
+                        next_run_str = f"Geplant um {jtime} Uhr"
+
                     if already_ran_today:
-                        next_run_str = f"Morgen, {jtime} Uhr"
-                    elif now_t < start_t:
-                        next_run_str = f"Heute, {jtime} Uhr"
-                    elif start_t <= now_t <= until_t:
-                        next_run_str = f"Heute fällig (Zeitfenster aktiv bis {j.get('catchup_until', '23:59')} Uhr)"
+                        last_label = f"Heute gelaufen ({jtime} Uhr)"
+                    elif last_run:
+                        last_label = f"{last_run}"
                     else:
-                        next_run_str = f"Morgen, {jtime} Uhr (heute verpasst nach {j.get('catchup_until', '23:59')} Uhr)"
-                except Exception:
-                    next_run_str = f"Geplant um {jtime} Uhr"
+                        last_label = "noch nicht gelaufen"
 
-                if already_ran_today:
-                    last_label = f"Heute gelaufen ({jtime} Uhr)"
-                elif last_run:
-                    last_label = f"{last_run}"
+                    job_lines.append(f"• *{j_name}* ({jtime} Uhr)\n   ↳ Zuletzt: `{last_label}` | Nächster Lauf: *{next_run_str}*")
+
+                cal_events = fetch_google_calendar_events(days_ahead=7)
+                cal_cnt = len(cal_events)
+                todo_cnt = len([t for t in state.get("tasks", []) if t.get("kind") == "To-Do" and t.get("status") != "Erledigt"])
+
+                if cal_cnt > 0:
+                    cal_details = []
+                    for ev in cal_events[:4]:
+                        t_str = f" um {ev['start_time']} Uhr" if ev.get("start_time") else " (Ganztägig)"
+                        loc_str = f" [{ev['location']}]" if ev.get("location") else ""
+                        cal_details.append(f"   ↳ *{ev.get('date')}*{t_str}: {ev.get('title')}{loc_str}")
+                    cal_section = f"📅 *Google Kalender:* {cal_cnt} Termine in den nächsten 7 Tagen:\n" + "\n".join(cal_details)
                 else:
-                    last_label = "noch nicht gelaufen"
+                    has_ics = bool(os.environ.get("GOOGLE_CALENDAR_ICS_URL", "").strip())
+                    has_gcal = bool(get_gcalendar_bin())
+                    if has_ics or has_gcal:
+                        cal_section = "📅 *Google Kalender:* 0 Termine in den nächsten 7 Tagen gefunden (Feed aktiv)."
+                    else:
+                        cal_section = (
+                            "📅 *Google Kalender:* Keine Termine gefunden (Quelle fehlt)\n"
+                            "   ⚠️ _Tipp: Trage `GOOGLE_CALENDAR_ICS_URL` in `.env` ein (Google Kalender -> Einstellungen -> Privatadresse im iCal-Format kopieren)._"
+                        )
 
-                job_lines.append(f"• *{j_name}* ({jtime} Uhr)\n   ↳ Zuletzt: `{last_label}` | Nächster Lauf: *{next_run_str}*")
-
-            cal_events = fetch_google_calendar_events(days_ahead=7)
-            cal_cnt = len(cal_events)
-            todo_cnt = len([t for t in state.get("tasks", []) if t.get("kind") == "To-Do" and t.get("status") != "Erledigt"])
-
-            if cal_cnt > 0:
-                cal_details = []
-                for ev in cal_events[:4]:
-                    t_str = f" um {ev['start_time']} Uhr" if ev.get("start_time") else " (Ganztägig)"
-                    loc_str = f" [{ev['location']}]" if ev.get("location") else ""
-                    cal_details.append(f"   ↳ *{ev.get('date')}*{t_str}: {ev.get('title')}{loc_str}")
-                cal_section = f"📅 *Google Kalender:* {cal_cnt} Termine in den nächsten 7 Tagen:\n" + "\n".join(cal_details)
-            else:
-                has_ics = bool(os.environ.get("GOOGLE_CALENDAR_ICS_URL", "").strip())
-                has_gcal = bool(get_gcalendar_bin())
-                if has_ics or has_gcal:
-                    cal_section = "📅 *Google Kalender:* 0 Termine in den nächsten 7 Tagen gefunden (Feed aktiv)."
-                else:
-                    cal_section = (
-                        "📅 *Google Kalender:* Keine Termine gefunden (Quelle fehlt)\n"
-                        "   ⚠️ _Tipp: Trage `GOOGLE_CALENDAR_ICS_URL` in `.env` ein (Google Kalender -> Einstellungen -> Privatadresse im iCal-Format kopieren)._"
-                    )
-
-            status_text = (
-                f"🤖 *Assistent & Scheduler Status*\n\n"
-                f"🕒 *Serverzeit (Berlin):* {time_str}\n"
-                f"💬 *Deine Chat-ID:* `{chat_id}` (aktiv registriert)\n"
-                f"✅ *Notion Tasks:* {todo_cnt} offene Aufgaben\n"
-                f"{cal_section}\n\n"
-                f"⏰ *Automatischer Zeitplan (nächste Läufe):*\n" + "\n".join(job_lines) + "\n\n"
-                f"Tipp: Mit `/morgen` oder `/abend` kannst du dein Briefing jederzeit manuell anfordern."
-            )
-            _send_telegram_message(api_base, chat_id, status_text)
+                status_text = (
+                    f"🤖 *Assistent & Scheduler Status*\n\n"
+                    f"🕒 *Serverzeit (Berlin):* {time_str}\n"
+                    f"💬 *Deine Chat-ID:* `{chat_id}` (aktiv registriert)\n"
+                    f"✅ *Notion Tasks:* {todo_cnt} offene Aufgaben\n"
+                    f"{cal_section}\n\n"
+                    f"⏰ *Automatischer Zeitplan (nächste Läufe):*\n" + "\n".join(job_lines) + "\n\n"
+                    f"Tipp: Mit `/morgen` oder `/abend` kannst du dein Briefing jederzeit manuell anfordern."
+                )
+                _send_telegram_message(api_base, chat_id, status_text)
+            except Exception as s_err:
+                _send_telegram_message(api_base, chat_id, f"🤖 *Assistent Status*\n\n⚠️ Fehler beim Ermitteln des Detail-Status: {s_err}")
             count += 1
+            continue
+
+        if cmd_lower in ("/restart", "/neustart", "restart", "neustart", "/reload"):
+            _send_telegram_message(api_base, chat_id, "⚡ Assistent wird jetzt neu gestartet...")
+            count += 1
+            trigger_restart()
             continue
 
         if cmd_lower in ("start", "help", "hilfe") or cmd_lower.startswith(("/start", "/help", "/hilfe")):
@@ -3204,8 +3213,24 @@ def perform_self_update() -> tuple[bool, str]:
         )
         commit_info = log_proc.stdout.strip() if log_proc.returncode == 0 else ""
 
+        # Falls heute das Morgen- oder Abend-Briefing noch nicht kam oder verpasst wurde,
+        # setzen wir den Status dafür in scheduler_state.json zurück, damit der Neustart es nachholt.
+        try:
+            if SCHEDULER_STATE_PATH.exists():
+                st_data = json.loads(SCHEDULER_STATE_PATH.read_text(encoding="utf-8"))
+                st_data.pop("briefing_morning", None)
+                st_data.pop("briefing_evening", None)
+                SCHEDULER_STATE_PATH.write_text(json.dumps(st_data, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
         if already_up_to_date:
-            return False, f"✅ Das System ist bereits auf dem neuesten Stand!\n\n📌 Aktueller Commit:\n`{commit_info}`"
+            msg = (
+                f"✅ *Das System ist bereits auf dem neuesten Stand!*\n\n"
+                f"📌 *Aktueller Commit:*\n`{commit_info}`\n\n"
+                f"⚡ Starte Dienst neu, um alle Module frisch zu laden..."
+            )
+            return True, msg
 
         pip_note = ""
         if "requirements.txt" in pull_out:
@@ -3220,17 +3245,6 @@ def perform_self_update() -> tuple[bool, str]:
                 pip_note = "\n📦 Neue Python-Pakete wurden installiert."
             else:
                 pip_note = f"\n⚠️ Warnung bei pip install: {pip_proc.stderr[:120]}"
-
-        # Falls heute das Morgen- oder Abend-Briefing noch nicht kam oder verpasst wurde,
-        # setzen wir den Status dafür in scheduler_state.json zurück, damit der Neustart es nachholt.
-        try:
-            if SCHEDULER_STATE_PATH.exists():
-                st_data = json.loads(SCHEDULER_STATE_PATH.read_text(encoding="utf-8"))
-                st_data.pop("briefing_morning", None)
-                st_data.pop("briefing_evening", None)
-                SCHEDULER_STATE_PATH.write_text(json.dumps(st_data, indent=2), encoding="utf-8")
-        except Exception:
-            pass
 
         msg = (
             f"🔄 *Update erfolgreich heruntergeladen!*\n\n"
@@ -3258,6 +3272,9 @@ def trigger_restart() -> None:
         cmd_args = [sys.executable, script] + [a for a in sys.argv[1:] if a != script]
         try:
             print(f"[Restart] Führe Neustart aus: {' '.join(cmd_args)}")
+            if os.environ.get("INVOCATION_ID") or os.environ.get("JOURNAL_STREAM"):
+                print("[Restart] Systemd-Dienst erkannt -> beende Prozess für sauberen systemd-Neustart.")
+                os._exit(0)
             if sys.platform == "win32":
                 subprocess.Popen(cmd_args, cwd=BASE_DIR, close_fds=True)
                 os._exit(0)
