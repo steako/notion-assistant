@@ -1,0 +1,19 @@
+[Unit]
+Description=Notion & Telegram Assistent 24/7 Daemon & Scheduler
+After=network.target
+
+[Service]
+Type=simple
+# Passe User und Verzeichnispfade an dein System an:
+User=stefan
+WorkingDirectory=/home/stefan/notion-assistant
+# Pfad zu Python (oder venv):
+ExecStart=/usr/bin/python3 assistant.py daemon
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

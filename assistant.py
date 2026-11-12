@@ -3137,6 +3137,25 @@ def generate_briefing(
             if allowed and (allowed.isdigit() or (allowed.startswith("-") and allowed[1:].isdigit())):
                 chat_id = allowed
 
+        # Fallback für Server ohne gesetztes TELEGRAM_CHAT_ID: Letzte Chat-ID direkt aus Telegram getUpdates abfragen
+        if not chat_id and bot_token:
+            try:
+                gu_req = request.Request(f"https://api.telegram.org/bot{bot_token}/getUpdates?limit=10")
+                with request.urlopen(gu_req, timeout=10) as gu_resp:
+                    gu_data = json.loads(gu_resp.read().decode("utf-8"))
+                    for u in reversed(gu_data.get("result", [])):
+                        m = u.get("message") or u.get("edited_message")
+                        if m and m.get("chat", {}).get("id"):
+                            chat_id = str(m["chat"]["id"])
+                            state["last_telegram_chat_id"] = chat_id
+                            try:
+                                save_local_state(BASE_DIR / cfg["paths"]["local_state_file"], state)
+                            except Exception:
+                                pass
+                            break
+            except Exception:
+                pass
+
         if bot_token and chat_id:
             api_base = f"https://api.telegram.org/bot{bot_token}"
             ok = _send_telegram_message(api_base, chat_id, text)
@@ -3452,7 +3471,12 @@ def run_daemon(
                 else:
                     try:
                         os.kill(old_pid, 0)
-                        is_running = True
+                        cmdline_path = Path(f"/proc/{old_pid}/cmdline")
+                        if cmdline_path.exists():
+                            cmdline = cmdline_path.read_text(encoding="utf-8", errors="replace")
+                            is_running = "assistant.py" in cmdline or "python" in cmdline
+                        else:
+                            is_running = True
                     except OSError:
                         is_running = False
                 if is_running:
