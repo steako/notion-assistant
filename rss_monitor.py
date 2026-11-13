@@ -57,10 +57,17 @@ except ImportError:
     except Exception:
         requests = None
 
+try:
+    import trafilatura  # type: ignore
+except ImportError:
+    trafilatura = None
+
 import assistant  # bestehender Assistent: Config/.env, NotionClient, LLM-Auswahl, Benachrichtigungen
 import jev_client
 import llm_core
 import preprocess
+from core.storage import StateStore, atomic_write_json, safe_read_json
+from integrations import telegram_ui
 
 BASE_DIR = Path(__file__).resolve().parent
 FEEDS_PATH = BASE_DIR / "feeds.json"
@@ -74,6 +81,22 @@ RELEVANCE_ORDER = {"Niedrig": 0, "Mittel": 1, "Hoch": 2}
 
 log = logging.getLogger("rss_monitor")
 
+_STORE_CACHE: dict[str, StateStore] = {}
+
+
+def get_store(db_path: Path | None = None) -> StateStore:
+    """Gibt den zentralen SQLite-StateStore (inkl. Legacy-Migration) zurück."""
+    target = db_path or Path(os.environ.get("ASSISTANT_DB_PATH") or (BASE_DIR / "assistant.db"))
+    key = str(target.resolve())
+    if key not in _STORE_CACHE:
+        st = StateStore(target)
+        try:
+            st.migrate_from_legacy_json(BASE_DIR)
+        except Exception as exc:
+            log.debug("Legacy-Migration Hinweis: %s", exc)
+        _STORE_CACHE[key] = st
+    return _STORE_CACHE[key]
+
 
 # --------------------------------------------------------------------------------------
 # Hilfsfunktionen
@@ -82,13 +105,14 @@ log = logging.getLogger("rss_monitor")
 def setup_logging(verbose: bool = False) -> None:
     log.setLevel(logging.DEBUG if verbose else logging.INFO)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
-    fh = logging.FileHandler(LOG_PATH, encoding="utf-8")
-    fh.setFormatter(fmt)
-    log.addHandler(fh)
-    if sys.stderr is not None:  # unter pythonw.exe gibt es keine Konsole
-        sh = logging.StreamHandler(sys.stderr)
-        sh.setFormatter(fmt)
-        log.addHandler(sh)
+    if not log.handlers:
+        fh = logging.FileHandler(LOG_PATH, encoding="utf-8")
+        fh.setFormatter(fmt)
+        log.addHandler(fh)
+        if sys.stderr is not None:  # unter pythonw.exe gibt es keine Konsole
+            sh = logging.StreamHandler(sys.stderr)
+            sh.setFormatter(fmt)
+            log.addHandler(sh)
 
 
 def load_feeds_config() -> dict[str, Any]:
@@ -97,21 +121,17 @@ def load_feeds_config() -> dict[str, Any]:
 
 
 def load_state() -> dict[str, Any]:
-    if STATE_PATH.exists():
-        try:
-            return json.loads(STATE_PATH.read_text(encoding="utf-8"))
-        except Exception as exc:
-            log.warning("rss_state.json nicht lesbar (%s) – starte mit leerem Zustand.", exc)
-    return {"seen": {}, "knowledge": {}, "runs": []}
+    data = safe_read_json(STATE_PATH, {"seen": {}, "knowledge": {}, "runs": []})
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("seen", {})
+    data.setdefault("knowledge", {})
+    data.setdefault("runs", [])
+    return data
 
 
 def save_state(state: dict[str, Any]) -> None:
-    tmp = STATE_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
-    tmp.replace(STATE_PATH)
-
-
-import preprocess
+    atomic_write_json(STATE_PATH, state, indent=1)
 
 def sha(text: str) -> str:
     return preprocess.sha(text)
@@ -421,7 +441,12 @@ def fetch_atproto(source: dict[str, Any], max_age_days: int, max_items: int) -> 
     return out
 
 
-def collect_candidates(topic: dict[str, Any], settings: dict[str, Any], state: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
+def collect_candidates(
+    topic: dict[str, Any],
+    settings: dict[str, Any],
+    state: dict[str, Any],
+    store: StateStore | None = None,
+) -> tuple[list[dict[str, Any]], int]:
     max_age = int(settings.get("max_age_days", 10))
     max_items = int(settings.get("max_items_per_source", 25))
     undated_policy = settings.get("undated_policy", "keep")
@@ -432,6 +457,11 @@ def collect_candidates(topic: dict[str, Any], settings: dict[str, Any], state: d
     run_fps: set[str] = set()
     errors = 0
     for source in topic.get("sources", []):
+        src_name = str(source.get("name") or "Quelle")
+        source_key = f"{topic['id']}::{src_name}"
+        if store is not None and store.is_feed_tripped(source_key):
+            log.info("[%s] Quelle '%s' vorübergehend pausiert (Circuit Breaker).", topic["id"], src_name)
+            continue
         try:
             stype = source.get("type", "rss").lower()
             if stype == "europepmc":
@@ -440,9 +470,16 @@ def collect_candidates(topic: dict[str, Any], settings: dict[str, Any], state: d
                 items = fetch_atproto(source, max_age, max_items)
             else:
                 items = fetch_rss(source, max_age, max_items)
+            if store is not None:
+                store.record_feed_success(source_key, topic["id"], src_name)
         except Exception as exc:
             errors += 1
-            log.warning("[%s] Quelle '%s' fehlgeschlagen: %s", topic["id"], source.get("name"), exc)
+            if store is not None:
+                tripped = store.record_feed_failure(source_key, topic["id"], src_name, str(exc))
+                if tripped:
+                    log.warning("[%s] Quelle '%s' nach wiederholten Fehlern für 12h pausiert: %s", topic["id"], src_name, exc)
+                    continue
+            log.warning("[%s] Quelle '%s' fehlgeschlagen: %s", topic["id"], src_name, exc)
             continue
         fresh = 0
         for it in items:
@@ -462,13 +499,53 @@ def collect_candidates(topic: dict[str, Any], settings: dict[str, Any], state: d
             clean_it["source"] = it.get("source") or source.get("name")
             candidates.append(clean_it)
             fresh += 1
-        log.info("[%s] %-45s %3d Einträge, %3d neu", topic["id"], source.get("name", "")[:45], len(items), fresh)
+        log.info("[%s] %-45s %3d Einträge, %3d neu", topic["id"], src_name[:45], len(items), fresh)
 
     # Schutz vor Batch-Spitzen: Begrenze auf die neuesten N Kandidaten pro Thema
     capped = preprocess.cap_candidates(candidates, max_total=max_topic_candidates)
     if len(capped) < len(candidates):
         log.info("[%s] Kandidaten durch Cap von %d auf %d begrenzt.", topic["id"], len(candidates), len(capped))
     return capped, errors
+
+
+def fetch_article_fulltext(url: str, max_chars: int = 2400) -> str:
+    """Extrahiert optional den Artikel-Haupttext via trafilatura (überspringt Redirect/Social-Wrapper)."""
+    if trafilatura is None or not url:
+        return ""
+    lower_u = url.lower()
+    if any(skip in lower_u for skip in ("news.google.com", "bsky.app", "youtube.com", "youtu.be")):
+        return ""
+    try:
+        raw_bytes = _http_get_bytes(url, timeout=12)
+        html_str = raw_bytes.decode("utf-8", errors="replace")
+        extracted = trafilatura.extract(html_str, include_comments=False, include_tables=False) or ""
+        return extracted.strip()[:max_chars]
+    except Exception as exc:
+        log.debug("Volltext-Extraktion Hinweis (%s): %s", url[:60], exc)
+        return ""
+
+
+def enrich_candidates_fulltext(
+    candidates: list[dict[str, Any]],
+    settings: dict[str, Any],
+    max_enrich: int = 8,
+) -> int:
+    """Reichert Kandidaten mit kurzer Summary vor dem LLM-Aufruf um echten Artikeltext an."""
+    if trafilatura is None or not settings.get("enrich_fulltext", True):
+        return 0
+    enriched = 0
+    for c in candidates:
+        if enriched >= max_enrich:
+            break
+        cur_sum = (c.get("summary") or "").strip()
+        if len(cur_sum) >= 260:
+            continue
+        ft = fetch_article_fulltext(c.get("link", ""))
+        if ft and len(ft) > len(cur_sum) + 80:
+            c["summary"] = ft[:1500]
+            c["fulltext_enriched"] = True
+            enriched += 1
+    return enriched
 
 
 # --------------------------------------------------------------------------------------
@@ -551,7 +628,12 @@ SYSTEM_PROMPT = (
 )
 
 
-def build_prompt(topic: dict[str, Any], known: list[dict[str, Any]], batch: list[dict[str, Any]]) -> str:
+def build_prompt(
+    topic: dict[str, Any],
+    known: list[dict[str, Any]],
+    batch: list[dict[str, Any]],
+    ignored_examples: list[str] | None = None,
+) -> str:
     known_lines = "\n".join(
         f"- [{k.get('key')}] ({k.get('date', '')}, {k.get('category', '')}) {k.get('title', '')}"
         for k in known
@@ -559,9 +641,16 @@ def build_prompt(topic: dict[str, Any], known: list[dict[str, Any]], batch: list
     cand_lines = []
     for i, c in enumerate(batch):
         date = c["published"].date().isoformat() if c.get("published") else "?"
-        cand_lines.append(f"[{i}] {c['source']} | {date} | {c['title']}\n    {c.get('summary', '')[:700]}")
+        cand_lines.append(f"[{i}] {c['source']} | {date} | {c['title']}\n    {c.get('summary', '')[:900]}")
     cats = ", ".join(topic.get("categories", ["Sonstiges"]))
     today = dt.date.today().isoformat()
+    neg_block = ""
+    if ignored_examples:
+        neg_block = (
+            "\nVOM NUTZER ALS IRRELEVANT MARKIERT (ähnliche Meldungen bitte konsequent verwerfen):\n"
+            + "\n".join(f"- {ex}" for ex in ignored_examples[:8])
+            + "\n"
+        )
     return f"""Heute ist {today}.
 
 THEMA: {topic['name']}
@@ -569,7 +658,7 @@ FOKUS / KRITERIEN:
 {topic['focus']}
 
 ERLAUBTE KATEGORIEN: {cats}
-
+{neg_block}
 BEREITS BEKANNTES WISSEN (schon gemeldet – NICHT erneut melden):
 {known_lines}
 
@@ -716,6 +805,7 @@ def evaluate_topic(
     known: list[dict[str, Any]],
     settings: dict[str, Any],
     cfg: dict[str, Any],
+    store: StateStore | None = None,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]]]:
     """Gibt (Funde, Overviews, erfolgreich bewertete Kandidaten) zurück."""
     batch_size = int(settings.get("max_candidates_per_llm_call", 35))
@@ -726,11 +816,12 @@ def evaluate_topic(
     overviews: list[str] = []
     evaluated: list[dict[str, Any]] = []
     known_keys = {k.get("key") for k in known_ctx}
+    ignored_examples = store.get_recent_negative_feedback(topic["id"]) if store is not None else []
 
     for start in range(0, len(candidates), batch_size):
         batch = candidates[start:start + batch_size]
         try:
-            result = llm_json(build_prompt(topic, known_ctx, batch), SYSTEM_PROMPT, cfg)
+            result = llm_json(build_prompt(topic, known_ctx, batch, ignored_examples=ignored_examples), SYSTEM_PROMPT, cfg)
         except Exception as exc:
             log.error("[%s] LLM-Bewertung fehlgeschlagen (%s) – Batch wird beim nächsten Lauf erneut geprüft.", topic["id"], exc)
             continue
@@ -910,47 +1001,82 @@ def create_digest_page(
 # Benachrichtigung
 # --------------------------------------------------------------------------------------
 
-def send_telegram_msg(token: str, chat_id: str, text: str) -> bool:
-    """Sendet Nachricht an Telegram und gibt True zurück wenn erfolgreich."""
-    if not token or not chat_id:
-        return False
-    try:
-        payload = json.dumps({"chat_id": chat_id, "text": text}).encode("utf-8")
-        req = urllib.request.Request(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return bool(data.get("ok"))
-    except urllib.error.HTTPError as he:
-        log.warning("Telegram HTTP-Fehler (%s) an %s: %s", he.code, chat_id, he.reason)
-        return False
-    except Exception as exc:
-        log.warning("Telegram-Fehler an %s: %s", chat_id, exc)
-        return False
+def send_telegram_msg(
+    token: str,
+    chat_id: str,
+    text: str,
+    parse_mode: str | None = "HTML",
+    reply_markup: dict[str, Any] | None = None,
+) -> bool:
+    """Sendet Nachricht an Telegram über die einheitliche Transport-Schicht."""
+    return telegram_ui.send_message(
+        token=token,
+        chat_id=chat_id,
+        text=text,
+        parse_mode=parse_mode,
+        reply_markup=reply_markup,
+    )
 
 
-def notify(results: list[dict[str, Any]], digest_url: str | None, settings: dict[str, Any]) -> None:
+def notify(
+    results: list[dict[str, Any]],
+    digest_url: str | None,
+    settings: dict[str, Any],
+    store: StateStore | None = None,
+) -> None:
     total = sum(len(r["findings"]) for r in results)
     if total == 0:
         return
-    lines = [f"📡 RSS-Monitor: {total} neue Funde"]
+
+    esc = telegram_ui.esc
+    lines = [f"📡 <b>RSS-Monitor: {total} neue Funde</b>"]
+    action_buttons: list[list[tuple[str, str]]] = []
+    btn_idx = 0
+
     for r in results:
         if not r["findings"]:
             continue
-        lines.append(f"\n{r['topic'].get('emoji', '')} {r['topic']['name']}")
+        emoji = r["topic"].get("emoji", "")
+        lines.append(f"\n{esc(emoji)} <b>{esc(r['topic']['name'])}</b>")
         for f in r["findings"][:6]:
             badge = {"Hoch": "🔴", "Mittel": "🟡", "Niedrig": "⚪"}.get(f["relevance"], "•")
-            extra = f" ({f['discount']})" if f.get("discount") else ""
-            lines.append(f"{badge} {f['title']}{extra}\n   {f['link']}")
+            extra = f" ({esc(f['discount'])})" if f.get("discount") else ""
+            title_html = esc(f["title"])
+            link = f.get("link") or ""
+            title_part = f'<a href="{esc(link)}">{title_html}</a>' if link else title_html
+            summary_short = esc((f.get("summary") or "")[:180])
+            btn_idx += 1
+            lines.append(f"{badge} <b>#{btn_idx}</b> {title_part}{extra}")
+            if summary_short:
+                lines.append(f"   <i>{summary_short}</i>")
+
+            if store is not None and btn_idx <= 3:
+                raw_key = f"{f.get('topic_id', '')}|{f.get('key', '')}|{f.get('title', '')}"
+                tok = hashlib.sha1(raw_key.encode("utf-8")).hexdigest()[:10]
+                store.put_callback_payload(
+                    tok,
+                    "rss_finding",
+                    {
+                        "topic_id": f.get("topic_id", ""),
+                        "topic_name": f.get("topic_name", ""),
+                        "title": f.get("title", ""),
+                        "summary": f.get("summary", ""),
+                        "link": link,
+                        "category": f.get("category", ""),
+                    },
+                )
+                action_buttons.append([
+                    (f"📌 #{btn_idx} Task", f"rss_task:{tok}"),
+                    (f"🎬 #{btn_idx} Idee", f"rss_idea:{tok}"),
+                    (f"👎 #{btn_idx}", f"rss_bad:{tok}"),
+                ])
         if len(r["findings"]) > 6:
             lines.append(f"   … und {len(r['findings']) - 6} weitere")
+
     if digest_url:
-        lines.append(f"\n📄 Digest in Notion: {digest_url}")
+        lines.append(f'\n📄 <a href="{esc(digest_url)}">Vollständigen Digest in Notion öffnen</a>')
     text = "\n".join(lines)
+    markup = telegram_ui.build_inline_keyboard(action_buttons) if action_buttons else None
 
     if settings.get("notify_telegram", True):
         rss_token = os.environ.get("TELEGRAM_RSSBOT_TOKEN", "").strip()
@@ -958,26 +1084,21 @@ def notify(results: list[dict[str, Any]], digest_url: str | None, settings: dict
 
         # Chat-ID ermitteln (RSS-spezifisch oder Haupt-Chat-ID)
         chat_id = os.environ.get("TELEGRAM_RSS_CHAT_ID", "").strip() or os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+        if not chat_id and store is not None:
+            chat_id = str(store.get_kv("last_rss_chat_id", "") or store.get_kv("last_telegram_chat_id", "") or "")
         if not chat_id and STATE_PATH.exists():
-            try:
-                rss_st = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+            rss_st = safe_read_json(STATE_PATH, {})
+            if isinstance(rss_st, dict):
                 chat_id = str(rss_st.get("last_rss_chat_id") or "")
-            except Exception:
-                pass
         if not chat_id:
-            try:
-                chat_id = str(json.loads((BASE_DIR / "local_state.json").read_text(encoding="utf-8")).get("last_telegram_chat_id") or "")
-            except Exception:
-                chat_id = ""
+            loc_st = safe_read_json(BASE_DIR / "local_state.json", {})
+            if isinstance(loc_st, dict):
+                chat_id = str(loc_st.get("last_telegram_chat_id") or "")
 
         sent = False
         # 1. Bevorzuge den dedizierten RSS-Bot
         if rss_token and chat_id:
-            all_ok = True
-            for i in range(0, len(text), 3900):
-                if not send_telegram_msg(rss_token, chat_id, text[i:i + 3900]):
-                    all_ok = False
-            if all_ok:
+            if send_telegram_msg(rss_token, chat_id, text, parse_mode="HTML", reply_markup=markup):
                 sent = True
                 log.info("Telegram-Benachrichtigung über RSS-Bot gesendet.")
             else:
@@ -985,8 +1106,7 @@ def notify(results: list[dict[str, Any]], digest_url: str | None, settings: dict
 
         # 2. Fallback auf den Haupt-Bot, falls kein RSS-Bot oder ungesendet
         if not sent and main_token and chat_id:
-            for i in range(0, len(text), 3900):
-                send_telegram_msg(main_token, chat_id, text[i:i + 3900])
+            send_telegram_msg(main_token, chat_id, text, parse_mode="HTML", reply_markup=markup)
             log.info("Telegram-Benachrichtigung über Haupt-Bot gesendet (Fallback).")
         elif not (rss_token or main_token) or not chat_id:
             log.info("Telegram nicht konfiguriert (Token oder Chat-ID fehlt).")
@@ -997,12 +1117,85 @@ def notify(results: list[dict[str, Any]], digest_url: str | None, settings: dict
 
 
 # --------------------------------------------------------------------------------------
-# Hauptablauf
+# Hauptablauf & Wochen-Synthese
 # --------------------------------------------------------------------------------------
 
 def prune_seen(state: dict[str, Any], retention_days: int) -> None:
     cutoff = (dt.datetime.now() - dt.timedelta(days=retention_days)).isoformat()
     state["seen"] = {k: v for k, v in state["seen"].items() if v >= cutoff}
+
+
+def generate_weekly_rss_synthesis(
+    cfg: dict[str, Any] | None = None,
+    store: StateStore | None = None,
+    notion: Any = None,
+    days: int = 7,
+) -> tuple[str, str | None]:
+    """Erstellt eine themenübergreifende Wochen-Synthese aus den gespeicherten RSS-Funden."""
+    cfg = cfg or assistant.load_config()
+    store = store or get_store()
+    items = store.get_recent_knowledge(days=days, limit=60)
+    if not items:
+        return "📡 <b>Wochen-Synthese:</b> In den letzten 7 Tagen wurden keine neuen RSS-Funde gespeichert.", None
+
+    bullet_input = "\n".join(
+        f"- [{it.get('topic_id')}] ({it.get('relevance')}) {it.get('title')}: {(it.get('summary') or '')[:220]}"
+        for it in items
+    )
+    prompt = f"""Analysiere die folgenden {len(items)} RSS- und Studienfunde der letzten {days} Tage für Stefan Kollmeier:
+
+{bullet_input}
+
+Erstelle eine prägnante Wochen-Synthese als JSON:
+{{
+  "headline": "Kurze Überschrift der Woche",
+  "trends": ["3-5 wichtigste Erkenntnisse oder Trends über alle Themen hinweg"],
+  "content_ideas": ["1-2 konkrete Ideen für Vorlesung, YouTube ('Life on Pause') oder Recherche"]
+}}"""
+    system = "Du bist Stefans wissenschaftlicher Forschungs-Redakteur. Antworte AUSSCHLIESSLICH mit validem JSON."
+    try:
+        res = llm_json(prompt, system, cfg)
+    except Exception:
+        res = {
+            "headline": f"Wochen-Synthese ({len(items)} Funde)",
+            "trends": [f"[{it.get('topic_id')}] {it.get('title')}" for it in items[:5]],
+            "content_ideas": [],
+        }
+
+    esc = telegram_ui.esc
+    lines = [f"🧠 <b>{esc(res.get('headline') or 'Wochen-Synthese')}</b> ({len(items)} Funde)\n"]
+    trends = res.get("trends") or []
+    if trends:
+        lines.append("📌 <b>Wichtigste Trends & Erkenntnisse:</b>")
+        for tr in trends[:6]:
+            lines.append(f"• {esc(tr)}")
+    ideas = res.get("content_ideas") or []
+    if ideas:
+        lines.append("\n🎬 <b>Impulse für Lehre &amp; Content:</b>")
+        for id_item in ideas[:3]:
+            lines.append(f"• {esc(id_item)}")
+
+    doc_url: str | None = None
+    if notion is not None:
+        md_lines = [
+            f"## {res.get('headline') or 'Wochen-Synthese'}",
+            *[f"- {tr}" for tr in trends],
+            "## Impulse für Lehre & Content",
+            *[f"- {id_item}" for id_item in ideas],
+        ]
+        try:
+            doc_url = notion.create_document_page(
+                cfg["notion"]["documents_database_id"],
+                title=f"RSS Wochen-Synthese {dt.date.today():%d.%m.%Y}",
+                category="Research",
+                markdown_lines=md_lines,
+                emoji="🧠",
+            )
+            lines.append(f'\n📄 <a href="{esc(doc_url)}">Synthese in Notion öffnen</a>')
+        except Exception as exc:
+            log.warning("Synthese Notion-Dokument fehlgeschlagen: %s", exc)
+
+    return "\n".join(lines), doc_url
 
 
 def run(args: argparse.Namespace) -> int:
@@ -1014,6 +1207,7 @@ def run(args: argparse.Namespace) -> int:
     state.setdefault("seen", {})
     state.setdefault("knowledge", {})
     state.setdefault("runs", [])
+    store = get_store()
 
     token = os.environ.get("NOTION_TOKEN", "").strip()
     notion = assistant.NotionClient(token) if token and not args.no_notion else None
@@ -1037,7 +1231,7 @@ def run(args: argparse.Namespace) -> int:
     now_iso = dt.datetime.now().isoformat(timespec="seconds")
     for topic in topics:
         log.info("=== %s %s ===", topic.get("emoji", ""), topic["name"])
-        candidates, _ = collect_candidates(topic, settings, state)
+        candidates, _ = collect_candidates(topic, settings, state, store=store)
         if not candidates:
             log.info("[%s] Keine neuen Kandidaten.", topic["id"])
             results.append({"topic": topic, "findings": [], "overview": ""})
@@ -1058,6 +1252,10 @@ def run(args: argparse.Namespace) -> int:
             results.append({"topic": topic, "findings": [], "overview": ""})
             continue
 
+        enriched_cnt = enrich_candidates_fulltext(passed_cands, settings)
+        if enriched_cnt:
+            log.info("[%s] %d Artikel mit Volltext (trafilatura) angereichert.", topic["id"], enriched_cnt)
+
         known: list[dict[str, Any]] = []
         limit = int(settings.get("known_context_items", 150))
         if notion:
@@ -1075,7 +1273,7 @@ def run(args: argparse.Namespace) -> int:
             log.info("savings_est topic=%s dropped_tokens≈%d dropped_items=%d", topic["id"], saved_est, filter_stats.get("dropped", 0))
 
         log.info("[%s] Bewerte %d gefilterte Kandidaten gegen %d bekannte Einträge ...", topic["id"], len(passed_cands), len(known))
-        findings, overviews, evaluated = evaluate_topic(topic, passed_cands, known, settings, cfg)
+        findings, overviews, evaluated = evaluate_topic(topic, passed_cands, known, settings, cfg, store=store)
         log.info("[%s] %d neue relevante Funde.", topic["id"], len(findings))
 
         written: list[dict[str, Any]] = []
@@ -1095,6 +1293,7 @@ def run(args: argparse.Namespace) -> int:
                 "key": f["key"], "title": f["title"], "date": dt.date.today().isoformat(),
                 "category": f["category"], "link": f["link"],
             })
+            store.add_knowledge_record(f)
 
         if not args.dry_run:
             # Erfolgreich von Gemini bewertete Kandidaten als gesehen markieren
@@ -1120,7 +1319,7 @@ def run(args: argparse.Namespace) -> int:
         state["runs"] = ([{"at": now_iso, "new": total, "digest": digest_url}] + state["runs"])[:60]
         save_state(state)
         if not args.no_notify:
-            notify(results, digest_url, settings)
+            notify(results, digest_url, settings, store=store)
 
     log.info("Fertig: %d neue Funde.", total)
     return 0
@@ -1131,9 +1330,7 @@ def run(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------------------
 
 def save_feeds_config(cfg: dict[str, Any]) -> None:
-    tmp = FEEDS_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(FEEDS_PATH)
+    atomic_write_json(FEEDS_PATH, cfg, indent=2)
 
 
 def slugify_topic_id(name: str) -> str:
@@ -1515,12 +1712,22 @@ def main() -> None:
     sub.add_parser("topics", help="Kurzübersicht aller Themen")
     sub.add_parser("test-feeds", help="Erreichbarkeit aller Quellen prüfen")
     sub.add_parser("bot", help="Dedizierten Telegram-Bot für den RSS-Wissensspeicher starten")
+    p_syn = sub.add_parser("synthese", help="Themenübergreifende Wochen-Synthese generieren")
+    p_syn.add_argument("--days", type=int, default=7, help="Anzahl Tage (Standard: 7)")
 
     args = parser.parse_args()
 
     if args.command == "bot":
         import rss_bot
         rss_bot.main()
+        return
+
+    if args.command == "synthese":
+        cfg = assistant.load_config()
+        token = os.environ.get("NOTION_TOKEN", "").strip()
+        notion = assistant.NotionClient(token) if token else None
+        html_out, _ = generate_weekly_rss_synthesis(cfg=cfg, store=get_store(), notion=notion, days=args.days)
+        print(telegram_ui.strip_html_tags(html_out))
         return
 
     if args.command in ("topics", "topic"):

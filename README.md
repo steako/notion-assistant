@@ -87,76 +87,82 @@ Befehle im RSS-Bot:
 - `/neu <Name>` – Neues Thema per KI generieren & sofort aktivieren (z. B. `/neu Alzheimer`)
 - `/loeschen <id>` – Thema entfernen (z. B. `/loeschen alt_thema`)
 - `/run` – Manuellen RSS-/Bluesky-Suchlauf sofort starten & Ergebnis in den Chat posten
+- `/synthese` – Themenübergreifende Wochen-Synthese über alle aktiven Themen
 - `/covid` – Neueste gefilterte Covid-19 Infektionszahlen von `@rv-enigma` abrufen
 - `/deals` – Aktuelle Studenten- & Dozenten-Rabatte anzeigen
-- `/suche <Begriff>` – Den gesamten Notion-Wissensspeicher nach Begriffen durchsuchen
-- `/status` – Übersicht über aktive Themen, gecachte Einträge und nächste Zeitplan-Läufe
-- *Freitext & Sprache:* Du kannst dem Bot auch Sprachnachrichten oder freie Fragen schicken (z. B. „Gibt es neue Studien zu Long COVID?“).
+- `/suche <Begriff>` – Notion & lokalen Wissensspeicher (BM25) durchsuchen
+- `/status` – Übersicht über aktive Themen, Feed-Health (Circuit Breaker) & nächste Läufe
+- *Interaktive Buttons:* Unter neuen Artikeln direkt `👎 Irrelevant`, `📌 Task` oder `🎬 Video-Idee` klicken
+- *Freitext, Sprache & PDFs:* Fragen, Sprachnachrichten oder PDF-Studien direkt im Chat senden
 
 ---
 
-## Wie du unterwegs Sprachnachrichten & kurze Texte aufnimmst
+## Wie du unterwegs Sprachnachrichten, Fotos & Texte aufnimmst
 
-### Weg 1: Direkt in der Notion-App (Empfohlen für Alltag & Diktat)
+### Weg 1: Telegram Haupt-Bot (Empfohlen – inkl. Buttons, Slots & Multimodalität)
+Sende Sprachnotizen, Text, **Fotos** (Terminzettel/Rechnungen) oder **PDFs/Textdateien** direkt in den Telegram-Chat:
+- **Multi-Tool Agent:** Versteht auch komplexe Anfragen mit mehreren Aktionen in einer Nachricht + Multi-Turn-Gedächtnis.
+- **Schnellbefehle:**
+  - `/morgen`, `/abend`, `/briefing` – Tages-Briefing inkl. freier Slots & Quick-Buttons (`✅ erledigen`, `📅 auf morgen`)
+  - `/slots [heute|morgen|YYYY-MM-DD]` – Freie Zeitfenster (inkl. anonymer Arbeits-Blocker) & Smart Time-Blocking (`⏱️ Blocken`)
+  - `/todos`, `/erledigt <Nr>`, `/undo` – Aufgaben verwalten & letzte Änderung rückgängig machen
+  - `/review` – Wochen-Review (Erledigt, verschobene Engpass-Tasks, RSS-Highlights)
+  - `/suche <Begriff>` – Kombinierte Suche in Notion, Notizen & RSS-Wissensspeicher (BM25)
+  - `/kalender`, `/ideen`, `/mails`, `/themen`, `/status`, `/update`
+
+### Weg 2: Direkt in der Notion-App (Empfohlen für Alltag & Diktat)
 1. Füge auf deinem Smartphone-Homescreen ein **Notion-Widget** hinzu, das direkt auf deine Datenbank **[AI Inbox](https://app.notion.com/p/4269a0f6fa41495a96fb82417d95762d)** (oder das **[Cockpit](https://app.notion.com/p/40928f20975581359a5dca0ea5754723)**) zeigt.
 2. Tippe auf **`+ Neu`** und nutze das **Mikrofon-Symbol deiner Smartphone-Tastatur** (iOS/Android-Diktierfunktion). Der gesprochene Text steht sofort kostenlos in der Seite, Status ist automatisch **`Neu`**.
 
-### Weg 2: Echte Sprachdateien (.m4a, .mp3, .ogg, .wav) oder Textdateien über `inbox_drop/`
-1. Lege Sprachmemos oder Textdateien in den Ordner `c:\Projekte\Notion\inbox_drop\` (z. B. synchronisiert vom Handy über OneDrive, Nextcloud, Google Drive oder FolderSync).
-2. `assistant.py` transkribiert Audiodateien lokal mit **`faster-whisper`** und wertet sie anschließend lokal über **Ollama** aus.
+### Weg 3: Audiodateien oder Textdateien über `inbox_drop/`
+1. Lege Sprachmemos oder Textdateien in den Ordner `inbox_drop/`.
+2. `assistant.py` transkribiert Audiodateien via Gemini / `faster-whisper` und synchronisiert mit Notion.
 
 ---
 
 ## Nutzung des lokalen Assistenten (`assistant.py`)
 
-### 1. Neue Notizen auswerten & Briefing anzeigen
-```powershell
-python assistant.py run
-```
-
-### 2. Schnelle Notiz direkt per Kommandozeile einwerfen
-```powershell
-python assistant.py add --title "Idee für Vorlesung" --text "Bis Freitag Folien für Kapitel 3 ergänzen und kurzes Quiz erstellen"
-```
-
-### 3. Nur das aktuelle Tages-Briefing (inkl. Windows-Benachrichtigung) abrufen
-```powershell
-python assistant.py briefing --notify
-```
-
-### 4. Dauerhafter 24/7 Hintergrund-Dienst (Linux VM / GCP / Server)
 ```bash
-python assistant.py daemon
+python assistant.py run               # Einmaliger Sync + Briefing
+python assistant.py daemon            # 24/7 Hintergrund-Dienst (Telegram, Scheduler, Pre-Meeting-Pings)
+python assistant.py briefing --mode morning --telegram
+python assistant.py review --telegram # Wochen-Review erstellen & senden
+python assistant.py sync-calendar     # Offene Termine mit Google Kalender abgleichen
 ```
-Steuert automatisch alle zeitgesteuerten Aufgaben:
-- **07:30 Uhr:** RSS-Recherche & Morgen-Briefing per Telegram
-- **18:30 Uhr:** Abend-RSS-Recherche
-- **19:30 Uhr:** Abend-Briefing (Rückblick & Vorschau)
-- **Alle 15 Min:** Schnelle Inbox-Prüfung
-- **Kontinuierlich:** Telegram-Bot-Polling mit Befehlen (`/status`, `/update`, `/morgen`, `/abend`, `/themen`, `/run`, etc.)
+
+Integrierter Zeitplan (Europe/Berlin):
+- **07:30 & 18:30 Uhr:** RSS-Recherche
+- **08:00 & 19:30 Uhr:** Morgen-Briefing & Abend-Checkliste
+- **Sonntags 18:00 & 18:15 Uhr:** Weekly Review & RSS-Wochen-Synthese
+- **Laufend (alle 5 Min):** Sync, Inbox & Pre-Meeting-Briefing-Pings (40 Min vor privaten Terminen)
 
 ---
 
-## 📅 Google Kalender Integration (iCal)
+## 📅 Google Kalender Integration (iCal + OAuth2 CRUD)
 
-Für Systeme ohne lokales `gcalendar` CLI (wie GCP Linux VMs):
-1. Öffne Google Kalender im Browser.
-2. Klicke links neben deinem Kalender auf die drei Punkte `⋮` -> **Einstellungen und Freigabe**.
-3. Scrolle nach unten zu **Privatadresse im iCal-Format** und kopiere die geheime URL (endet auf `.ics`).
-4. Füge die URL in deiner `.env` ein:
-   ```env
-   GOOGLE_CALENDAR_ICS_URL=https://calendar.google.com/calendar/ical/.../basic.ics
-   ```
-   *(Tipp: Mehrere Kalender können kommagetrennt eingetragen werden: `URL1,URL2`)*
+1. **Lesen (inkl. Zeitzonen & Serientermine via `icalendar` + `recurring-ical-events`):**
+   Trage `GOOGLE_CALENDAR_ICS_URL` (Privatadresse im iCal-Format) in `.env` ein.
+2. **Schreiben/Ändern/Löschen auf Headless Linux VMs (OAuth2 Refresh Token):**
+   Trage optional `GOOGLE_CALENDAR_CLIENT_ID`, `GOOGLE_CALENDAR_CLIENT_SECRET` und `GOOGLE_CALENDAR_REFRESH_TOKEN` in `.env` ein. Ohne OAuth2 werden Termine weiterhin als deterministische `.ics`-Dateien erzeugt.
 
-Der Parser unterstützt automatische Zeitzonen-Konvertierung nach `Europe/Berlin`, Serientermine (`RRULE` wie wöchentliche Termine) sowie Ausnahmen (`EXDATE`).
+---
+
+## 🔒 Datenschutz-sichere Arbeitskalender-Integration (MS Teams / Outlook: nur Frei/Belegt)
+
+Aus Datenschutz- und Cybersicherheitsgründen werden **NIEMALS** Arbeits-E-Mails, Termintitel, Teilnehmer oder Orte mit Notion oder externen LLMs synchronisiert. Der Assistent verarbeitet vom Arbeitskalender ausschließlich anonyme Zeitfenster (`date`, `start_time`, `end_time`, `title="Arbeit: Belegt"`):
+- **Option A (Outlook Free/Busy ICS):** Wenn IT-seitig erlaubt, Outlook Kalender nur als *„Nur Verfügbarkeit / Free-Busy“* teilen und die URL in `WORK_CALENDAR_FREEBUSY_ICS_URL` eintragen.
+- **Option B (MS Teams / Power Automate → anonyme JSON-Datei):** Ein kleiner M365 Power Automate Flow exportiert nur `Start` + `End` (ohne Betreff/Body!) nach `work_busy_slots.json` (siehe `WORK_BUSY_SLOTS_FILE`).
+- **Option C (MS Graph `getSchedule`):** Mit `MS_GRAPH_ACCESS_TOKEN` und `WORK_EMAIL` werden ausschließlich `scheduleItems` (Status `busy`/`oof`) abgefragt.
+
+Alle drei Optionen fließen lokal über `sanitize_work_busy_slots()` in `/slots`, freie Zeitfenster und Smart Time-Blocking ein.
 
 ---
 
 ## Vollautomatischer Hintergrund-Sync ohne Antigravity
 
-1. **Optional für direkten Hintergrund-Zugriff ohne Antigravity:** Erstelle unter [notion.so/profile/integrations](https://www.notion.so/profile/integrations) ein kostenloses internes Notion-Token (`ntn_...`), kopiere `.env.example` zu `.env`, trage `NOTION_TOKEN=ntn_...` ein und verbinde die Integration in Notion über das `•••`-Menü oben rechts auf `AI Inbox` und `Tasks`.
-2. **Automatische Windows-Hintergrundaufgabe aktivieren (alle 30 Min.):**
+1. Erstelle unter [notion.so/profile/integrations](https://www.notion.so/profile/integrations) ein kostenloses internes Notion-Token (`ntn_...`), kopiere `.env.example` zu `.env`, trage `NOTION_TOKEN=ntn_...` ein und verbinde die Integration in Notion über das `•••`-Menü oben rechts auf `AI Inbox` und `Tasks`.
+2. **Automatische Windows-Hintergrundaufgabe aktivieren:**
    ```powershell
    .\setup_scheduler.ps1
    ```
+

@@ -5,12 +5,18 @@
 
 # Lokale Zustände, Caches & Logs (enthalten persönliche Daten/Kalendereinträge)
 *.log
+*.log.*
 *.pid
 *.lock
+*.db
+*.db-wal
+*.db-shm
+*.tmp
 local_state.json
 rss_state.json
 gcal_cache.json
 scheduler_state.json
+work_busy_slots.json
 
 # Audio- und Notiz-Drops von unterwegs
 inbox_drop/*

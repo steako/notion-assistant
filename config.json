@@ -27,9 +27,15 @@
     }
   },
   "chat": {
-    "max_iterations": 3,
-    "max_input_tokens": 12000
+    "max_iterations": 4,
+    "max_input_tokens": 14000,
+    "enable_tool_agent": true
   },
+  "work_hours": {
+    "start": "08:00",
+    "end": "20:00"
+  },
+  "pre_meeting_lead_minutes": 40,
   "transcription": {
     "provider": "gemini",
     "fallback_provider": "whisper"

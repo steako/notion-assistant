@@ -30,6 +30,11 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
+from core import agent_tools
+from core.storage import StateStore, atomic_write_json, safe_read_json
+from integrations import telegram_ui
+from integrations.notion_client import NotionClient
+
 # Lokale Module einbinden
 try:
     import assistant
@@ -53,6 +58,21 @@ log = logging.getLogger("rss_bot")
 STATE_PATH = BASE_DIR / "rss_state.json"
 FEEDS_CONFIG_PATH = BASE_DIR / "feeds.json"
 
+_STORE_CACHE: dict[str, StateStore] = {}
+
+
+def get_store(db_path: Path | None = None) -> StateStore:
+    target = db_path or Path(os.environ.get("ASSISTANT_DB_PATH") or (BASE_DIR / "assistant.db"))
+    key = str(target.resolve())
+    if key not in _STORE_CACHE:
+        st = StateStore(target)
+        try:
+            st.migrate_from_legacy_json(BASE_DIR)
+        except Exception:
+            pass
+        _STORE_CACHE[key] = st
+    return _STORE_CACHE[key]
+
 
 # --------------------------------------------------------------------------------------
 # Konfiguration & Hilfsfunktionen
@@ -73,59 +93,37 @@ def get_active_token() -> str:
 
 
 def load_rss_state() -> dict[str, Any]:
-    if not STATE_PATH.exists():
-        return {"seen": {}, "last_rss_chat_id": "", "rss_telegram_offset": 0}
-    try:
-        data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            data = {}
-        data.setdefault("seen", {})
-        data.setdefault("last_rss_chat_id", "")
-        data.setdefault("rss_telegram_offset", 0)
-        return data
-    except Exception as exc:
-        log.warning("Fehler beim Lesen von rss_state.json: %s", exc)
-        return {"seen": {}, "last_rss_chat_id": "", "rss_telegram_offset": 0}
+    data = safe_read_json(STATE_PATH, {"seen": {}, "last_rss_chat_id": "", "rss_telegram_offset": 0})
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("seen", {})
+    data.setdefault("last_rss_chat_id", "")
+    data.setdefault("rss_telegram_offset", 0)
+    return data
 
 
 def save_rss_state(state: dict[str, Any]) -> None:
     try:
-        tmp = STATE_PATH.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state, indent=1, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(STATE_PATH)
+        atomic_write_json(STATE_PATH, state, indent=1)
     except Exception as exc:
         log.warning("Fehler beim Speichern von rss_state.json: %s", exc)
 
 
-def send_message(token: str, chat_id: str, text: str, parse_mode: str | None = None) -> bool:
-    """Sendet eine Nachricht an Telegram. Teilt lange Texte automatisch in Chunks."""
-    if not token or not chat_id:
-        return False
-    
-    success = True
-    for i in range(0, len(text), 3900):
-        chunk = text[i:i + 3900]
-        payload_data: dict[str, Any] = {"chat_id": chat_id, "text": chunk}
-        if parse_mode:
-            payload_data["parse_mode"] = parse_mode
-        try:
-            req = urllib.request.Request(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                data=json.dumps(payload_data).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                if not data.get("ok"):
-                    success = False
-        except urllib.error.HTTPError as he:
-            log.warning("Telegram HTTP-Fehler (%s) an %s: %s", he.code, chat_id, he.reason)
-            return False
-        except Exception as exc:
-            log.warning("Telegram-Fehler an %s: %s", chat_id, exc)
-            return False
-    return success
+def send_message(
+    token: str,
+    chat_id: str,
+    text: str,
+    parse_mode: str | None = "HTML",
+    reply_markup: dict[str, Any] | None = None,
+) -> bool:
+    """Sendet eine Nachricht an Telegram über die einheitliche HTML-Transport-Schicht."""
+    return telegram_ui.send_message(
+        token=token,
+        chat_id=chat_id,
+        text=text,
+        parse_mode=parse_mode,
+        reply_markup=reply_markup,
+    )
 
 
 def load_feeds_config() -> dict[str, Any]:
@@ -136,10 +134,9 @@ def load_feeds_config() -> dict[str, Any]:
         except Exception:
             pass
     if FEEDS_CONFIG_PATH.exists():
-        try:
-            return json.loads(FEEDS_CONFIG_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+        data = safe_read_json(FEEDS_CONFIG_PATH, {"topics": []})
+        if isinstance(data, dict):
+            return data
     return {"topics": []}
 
 
@@ -152,69 +149,61 @@ def query_notion_knowledge(filter_payload: dict[str, Any] | None = None, page_si
     token = os.environ.get("NOTION_TOKEN", "").strip()
     if not token:
         return []
-    
+
     feeds_cfg = load_feeds_config()
-    db_id = feeds_cfg.get("notion_database_id", "c7bac0f9-b222-4aa6-a0b4-2510fb987b7b").replace("-", "")
-    
-    payload: dict[str, Any] = {"page_size": page_size}
+    db_id = (
+        feeds_cfg.get("notion", {}).get("knowledge_database_id")
+        or feeds_cfg.get("notion_database_id")
+        or "c7bac0f9-b222-4aa6-a0b4-2510fb987b7b"
+    ).replace("-", "")
+
+    payload: dict[str, Any] = {"page_size": page_size, "sorts": [{"property": "Erfasst", "direction": "descending"}]}
     if filter_payload:
         payload["filter"] = filter_payload
-    payload["sorts"] = [{"property": "Erfasst", "direction": "descending"}]
 
     try:
-        req = urllib.request.Request(
-            f"https://api.notion.com/v1/databases/{db_id}/query",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Notion-Version": "2022-06-28",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data.get("results", [])
+        client = NotionClient(token)
+        res = client._request("POST", f"/databases/{db_id}/query", payload)
+        return res.get("results", [])
     except Exception as exc:
         log.warning("Notion-Abfragefehler: %s", exc)
         return []
 
 
 def format_notion_results(results: list[dict[str, Any]], title_header: str) -> str:
-    """Formatiert Notion-Seiten lesbar für Telegram."""
+    """Formatiert Notion-Seiten lesbar für Telegram HTML."""
+    esc = telegram_ui.esc
     if not results:
         return f"{title_header}\n\nKeine passenden Einträge im Wissensspeicher gefunden."
-    
+
     lines = [f"{title_header}\n"]
     for idx, page in enumerate(results, 1):
         props = page.get("properties", {})
         title_list = props.get("Titel", {}).get("title", [])
         title = title_list[0]["plain_text"] if title_list else "Ohne Titel"
-        
+
         thema_sel = props.get("Thema", {}).get("select") or {}
         thema = thema_sel.get("name", "")
-        
+
         rel_sel = props.get("Relevanz", {}).get("select") or {}
         rel = rel_sel.get("name", "")
-        
+
         link = props.get("Link", {}).get("url") or ""
-        
+
         summary_list = props.get("Zusammenfassung", {}).get("rich_text", [])
         summary = summary_list[0]["plain_text"] if summary_list else ""
-        
-        badge = f"[{thema}]" if thema else ""
+
+        badge = f"[{esc(thema)}]" if thema else ""
         if rel:
-            badge += f" ({rel})"
-            
-        lines.append(f"{idx}. {badge} *{title}*")
+            badge += f" ({esc(rel)})"
+
+        title_html = f'<a href="{esc(link)}">{esc(title)}</a>' if link else f"<b>{esc(title)}</b>"
+        lines.append(f"{idx}. {badge} {title_html}")
         if summary:
-            # Erste 1-2 Sätze
             first_sentence = summary.split(". ")[0] + ("." if not summary.endswith(".") else "")
-            lines.append(f"   _{first_sentence}_")
-        if link:
-            lines.append(f"   🔗 {link}")
+            lines.append(f"   <i>{esc(first_sentence[:220])}</i>")
         lines.append("")
-        
+
     return "\n".join(lines).strip()
 
 
@@ -224,34 +213,36 @@ def format_notion_results(results: list[dict[str, Any]], title_header: str) -> s
 
 def handle_start_or_help(chat_id: str) -> str:
     return (
-        "📡 *Willkommen beim RSS- & Wissensspeicher-Bot!*\n\n"
+        "📡 <b>Willkommen beim RSS- &amp; Wissensspeicher-Bot!</b>\n\n"
         "Ich sammle, bewerte und dedupliziere automatisch wissenschaftliche Studien, "
         "Durchbrüche, Bluesky-Signale und Rabattaktionen – getrennt von deinen privaten "
         "Kalenderterminen und Aufgaben.\n\n"
-        "📋 *Verfügbare Befehle:*\n"
-        "• `/themen` – Übersicht aller Themen & Status\n"
-        "• `/an <id>` – Thema aktivieren (z. B. `/an parkinson`)\n"
-        "• `/aus <id>` – Thema pausieren\n"
-        "• `/neu <Name>` – Neues Thema mit KI-Recherche anlegen\n"
-        "• `/loeschen <id>` – Thema dauerhaft entfernen\n"
-        "• `/run` – Sofortigen RSS-/Bluesky-Suchlauf starten\n"
-        "• `/covid` – Aktuelle Infektionsschätzung von @rv-enigma\n"
-        "• `/deals` – Aktuelle Rabattaktionen für Studenten/Dozenten\n"
-        "• `/suche <Begriff>` – Notion-Wissensspeicher durchsuchen\n"
-        "• `/status` – Systemstatus, Eintragszahl & nächste Termine\n"
-        "• `/update` – Neuesten Code von GitHub laden & Bot neu starten\n\n"
-        "💡 _Tipp: Du kannst mir auch einfach Fragen zu den Themen stellen "
-        "oder Sprachnachrichten senden!_"
+        "📋 <b>Verfügbare Befehle:</b>\n"
+        "• <code>/themen</code> – Übersicht aller Themen &amp; Status\n"
+        "• <code>/an &lt;id&gt;</code> – Thema aktivieren (z. B. <code>/an parkinson</code>)\n"
+        "• <code>/aus &lt;id&gt;</code> – Thema pausieren\n"
+        "• <code>/neu &lt;Name&gt;</code> – Neues Thema mit KI-Recherche anlegen\n"
+        "• <code>/loeschen &lt;id&gt;</code> – Thema dauerhaft entfernen\n"
+        "• <code>/run</code> – Sofortigen RSS-/Bluesky-Suchlauf starten\n"
+        "• <code>/synthese</code> – Themenübergreifende Wochen-Synthese erstellen\n"
+        "• <code>/covid</code> – Aktuelle Infektionsschätzung von @rv-enigma\n"
+        "• <code>/deals</code> – Aktuelle Rabattaktionen für Studenten/Dozenten\n"
+        "• <code>/suche &lt;Begriff&gt;</code> – Notion &amp; lokalen Wissensspeicher durchsuchen\n"
+        "• <code>/status</code> – Systemstatus, Feed-Health &amp; nächste Termine\n"
+        "• <code>/update</code> – Neuesten Code von GitHub laden &amp; Bot neu starten\n\n"
+        "💡 <i>Tipp: Du kannst mir auch Fragen zu den Themen stellen, Sprachnachrichten "
+        "oder PDF-Studien schicken und Funde direkt per Button als Task/Idee übernehmen!</i>"
     )
 
 
 def handle_themen(chat_id: str) -> str:
+    esc = telegram_ui.esc
     cfg = load_feeds_config()
     topics = cfg.get("topics", [])
     if not topics:
         return "Keine Themen in feeds.json konfiguriert."
 
-    lines = ["📡 *Konfigurierte Themengebiete:*\n"]
+    lines = ["📡 <b>Konfigurierte Themengebiete:</b>\n"]
     for t in topics:
         status = "🟢 Aktiv" if t.get("enabled", True) else "⚪ Pausiert"
         emoji = t.get("emoji", "📌")
@@ -260,24 +251,25 @@ def handle_themen(chat_id: str) -> str:
         sources_cnt = len(t.get("sources", []))
         min_rel = t.get("min_relevance", "Mittel")
 
-        lines.append(f"{emoji} *{name}* (`{tid}`) – {status}")
-        lines.append(f"   ↳ {sources_cnt} Quellen | Min-Relevanz: {min_rel}")
+        lines.append(f"{esc(emoji)} <b>{esc(name)}</b> (<code>{esc(tid)}</code>) – {status}")
+        lines.append(f"   ↳ {sources_cnt} Quellen | Min-Relevanz: {esc(min_rel)}")
         focus = t.get("focus", "")
         if focus:
             short_focus = focus[:120] + ("..." if len(focus) > 120 else "")
-            lines.append(f"   ↳ _{short_focus}_")
+            lines.append(f"   ↳ <i>{esc(short_focus)}</i>")
         lines.append("")
 
     lines.append("Steuerung:")
-    lines.append("• `/an <id>` / `/aus <id>` zum Ein- oder Ausschalten")
-    lines.append("• `/neu <Name>` um ein neues Thema per KI zu erstellen")
-    lines.append("• `/run` für einen sofortigen Suchlauf")
+    lines.append("• <code>/an &lt;id&gt;</code> / <code>/aus &lt;id&gt;</code> zum Ein- oder Ausschalten")
+    lines.append("• <code>/neu &lt;Name&gt;</code> um ein neues Thema per KI zu erstellen")
+    lines.append("• <code>/run</code> für einen sofortigen Suchlauf")
     return "\n".join(lines)
 
 
 def handle_toggle(chat_id: str, topic_id: str, enable: bool) -> str:
+    esc = telegram_ui.esc
     if not topic_id.strip():
-        return f"Bitte Themen-ID angeben, z. B. `/{'an' if enable else 'aus'} parkinson`."
+        return f"Bitte Themen-ID angeben, z. B. <code>/{'an' if enable else 'aus'} parkinson</code>."
     if rss_monitor is not None and hasattr(rss_monitor, "cmd_topic_set_enabled"):
         ok = rss_monitor.cmd_topic_set_enabled(topic_id.strip(), enable)
     else:
@@ -290,55 +282,57 @@ def handle_toggle(chat_id: str, topic_id: str, enable: bool) -> str:
                 break
         if ok:
             try:
-                FEEDS_CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+                atomic_write_json(FEEDS_CONFIG_PATH, cfg, indent=2)
             except Exception:
                 ok = False
     if ok:
         status_str = "aktiviert 🟢" if enable else "pausiert ⚪"
-        return f"Thema `{topic_id}` wurde {status_str}."
-    return f"Thema `{topic_id}` nicht gefunden. Nutze `/themen` für die Liste."
+        return f"Thema <code>{esc(topic_id)}</code> wurde {status_str}."
+    return f"Thema <code>{esc(topic_id)}</code> nicht gefunden. Nutze <code>/themen</code> für die Liste."
 
 
 def handle_neu(chat_id: str, new_name: str) -> str:
+    esc = telegram_ui.esc
     if not new_name.strip():
-        return "Bitte gib einen Namen an, z. B. `/neu Multiple Sklerose`."
+        return "Bitte gib einen Namen an, z. B. <code>/neu Multiple Sklerose</code>."
     if rss_monitor is None:
         return "Fehler: rss_monitor nicht verfügbar."
-    
+
     import argparse as _ap
     ns = _ap.Namespace(name=new_name.strip(), id=None, emoji=None, focus=None, rss=None, auto=True)
     ok = rss_monitor.cmd_topic_add(ns)
     if ok:
         return (
-            f"✅ Thema *{new_name}* wurde erfolgreich angelegt!\n"
-            f"Quellen aus Google News, Europe PMC und Bluesky wurden automatisch konfiguriert "
-            f"und aktiviert. Starte mit `/run` den ersten Suchlauf."
+            f"✅ Thema <b>{esc(new_name)}</b> wurde erfolgreich angelegt!\n"
+            "Quellen aus Google News, Europe PMC und Bluesky wurden automatisch konfiguriert "
+            "und aktiviert. Starte mit <code>/run</code> den ersten Suchlauf."
         )
-    return f"❌ Konnte Thema *{new_name}* nicht anlegen."
+    return f"❌ Konnte Thema <b>{esc(new_name)}</b> nicht anlegen."
 
 
 def handle_loeschen(chat_id: str, topic_id: str) -> str:
+    esc = telegram_ui.esc
     if not topic_id.strip():
-        return "Bitte Themen-ID angeben, z. B. `/loeschen mein_thema`."
+        return "Bitte Themen-ID angeben, z. B. <code>/loeschen mein_thema</code>."
     if rss_monitor is None:
         return "Fehler: rss_monitor nicht verfügbar."
-    
+
     ok = rss_monitor.cmd_topic_remove(topic_id.strip(), confirm=True)
     if ok:
-        return f"🗑️ Thema `{topic_id}` wurde gelöscht."
-    return f"❌ Thema `{topic_id}` konnte nicht gelöscht werden (nicht gefunden?)."
+        return f"🗑️ Thema <code>{esc(topic_id)}</code> wurde gelöscht."
+    return f"❌ Thema <code>{esc(topic_id)}</code> konnte nicht gelöscht werden (nicht gefunden?)."
 
 
 def handle_run_async(chat_id: str, token: str) -> None:
     """Führt rss_monitor.run() in einem separaten Thread aus."""
     if rss_monitor is None:
-        err_msg = f" ({_rss_monitor_import_error})" if _rss_monitor_import_error else ""
+        err_msg = f" ({telegram_ui.esc(_rss_monitor_import_error)})" if _rss_monitor_import_error else ""
         send_message(
             token,
             chat_id,
             f"❌ Fehler: rss_monitor nicht verfügbar{err_msg}.\n\n"
-            f"💡 Tipp: Bitte auf dem GCP-Server Abhängigkeiten installieren:\n"
-            f"`pip install -r requirements.txt`",
+            "💡 Tipp: Bitte auf dem Server Abhängigkeiten installieren:\n"
+            "<code>pip install -r requirements.txt</code>",
         )
         return
 
@@ -356,7 +350,7 @@ def handle_run_async(chat_id: str, token: str) -> None:
     send_message(
         token,
         chat_id,
-        "📡 *RSS- & Bluesky-Suchlauf gestartet!*\n"
+        "📡 <b>RSS- &amp; Bluesky-Suchlauf gestartet!</b>\n"
         "Ich prüfe Google News, Fachmagazine, Preprints, ATProto-Bluesky und Rabatte. "
         "Ergebnisse werden nach Abschluss gemeldet...",
     )
@@ -373,7 +367,6 @@ def handle_run_async(chat_id: str, token: str) -> None:
                 res = rss_monitor.run(ns)
                 log.info("Manueller Telegram-Run beendet mit Code %s", res)
 
-                # Prüfen, ob neue Funde gemeldet wurden:
                 st = load_rss_state()
                 last_run = (st.get("runs") or [{}])[0]
                 new_cnt = last_run.get("new", 0)
@@ -381,7 +374,7 @@ def handle_run_async(chat_id: str, token: str) -> None:
                     send_message(
                         token,
                         chat_id,
-                        "✅ *Suchlauf abgeschlossen.*\n"
+                        "✅ <b>Suchlauf abgeschlossen.</b>\n"
                         "Es wurden keine neuen relevanten Studien oder Artikel gefunden – alle Quellen sind aktuell.",
                     )
             finally:
@@ -389,7 +382,7 @@ def handle_run_async(chat_id: str, token: str) -> None:
                     rss_monitor.release_lock()
         except Exception as exc:
             log.exception("Fehler beim manuellen Suchlauf: %s", exc)
-            send_message(token, chat_id, f"❌ Fehler beim Suchlauf: {exc}")
+            send_message(token, chat_id, f"❌ Fehler beim Suchlauf: {telegram_ui.esc(exc)}")
 
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
@@ -402,7 +395,7 @@ def handle_covid(chat_id: str) -> str:
         "rich_text": {"contains": "rv-enigma"},
     }
     pages = query_notion_knowledge(filter_payload=filter_payload, page_size=5)
-    return format_notion_results(pages, "🦠 *Neueste COVID-19 Schätzungen (@rv-enigma auf Bluesky):*")
+    return format_notion_results(pages, "🦠 <b>Neueste COVID-19 Schätzungen (@rv-enigma auf Bluesky):</b>")
 
 
 def handle_deals(chat_id: str) -> str:
@@ -412,14 +405,15 @@ def handle_deals(chat_id: str) -> str:
         "select": {"equals": "Rabatte Studierende/Dozierende"},
     }
     pages = query_notion_knowledge(filter_payload=filter_payload, page_size=5)
-    return format_notion_results(pages, "🎓 *Aktuelle Rabatte für Studierende & Dozierende (≥ 50% / Free):*")
+    return format_notion_results(pages, "🎓 <b>Aktuelle Rabatte für Studierende &amp; Dozierende (≥ 50% / Free):</b>")
 
 
 def handle_suche(chat_id: str, query: str) -> str:
-    """Durchsucht den Wissensspeicher nach Begriffen."""
+    """Durchsucht Notion-Wissensspeicher + lokalen BM25-Index hybrid nach Begriffen."""
+    esc = telegram_ui.esc
     if not query.strip():
-        return "Bitte Suchbegriff angeben, z. B. `/suche Long COVID` oder `/suche Stammzellen`."
-    
+        return "Bitte Suchbegriff angeben, z. B. <code>/suche Long COVID</code> oder <code>/suche Stammzellen</code>."
+
     q = query.strip()
     filter_payload = {
         "or": [
@@ -428,17 +422,60 @@ def handle_suche(chat_id: str, query: str) -> str:
         ]
     }
     pages = query_notion_knowledge(filter_payload=filter_payload, page_size=5)
-    return format_notion_results(pages, f"🔍 *Suchergebnisse im Wissensspeicher für „{q}“:*")
+    local_hits = get_store().search_knowledge_bm25(q, limit=5)
+
+    notion_links = {
+        (p.get("properties", {}).get("Link", {}).get("url") or "")
+        for p in pages
+    }
+    extra_local = [h for h in local_hits if (h.get("link") or "") not in notion_links or not pages]
+
+    if pages:
+        msg = format_notion_results(pages, f"🔍 <b>Suchergebnisse im Wissensspeicher für „{esc(q)}“:</b>")
+        if extra_local:
+            msg += "\n\n🗂️ <b>Weitere Treffer im lokalen Archiv (BM25):</b>\n"
+            for idx, lh in enumerate(extra_local[:3], 1):
+                link = lh.get("link") or ""
+                title_h = f'<a href="{esc(link)}">{esc(lh.get("title", ""))}</a>' if link else f"<b>{esc(lh.get('title', ''))}</b>"
+                msg += f"{idx}. [{esc(lh.get('topic_id', ''))}] {title_h}\n"
+        return msg
+
+    if extra_local:
+        lines = [f"🔍 <b>Lokale Wissensspeicher-Treffer für „{esc(q)}“:</b>\n"]
+        for idx, lh in enumerate(extra_local[:5], 1):
+            link = lh.get("link") or ""
+            title_h = f'<a href="{esc(link)}">{esc(lh.get("title", ""))}</a>' if link else f"<b>{esc(lh.get('title', ''))}</b>"
+            badge = f"[{esc(lh.get('topic_id', ''))}]"
+            if lh.get("relevance"):
+                badge += f" ({esc(lh['relevance'])})"
+            lines.append(f"{idx}. {badge} {title_h}")
+            if lh.get("summary"):
+                lines.append(f"   <i>{esc(lh['summary'][:200])}</i>")
+            lines.append("")
+        return "\n".join(lines).strip()
+
+    return f"🔍 <b>Suchergebnisse im Wissensspeicher für „{esc(q)}“:</b>\n\nKeine passenden Einträge gefunden."
+
+
+def handle_synthese(chat_id: str) -> str:
+    """Erstellt eine themenübergreifende Wochen-Synthese über gespeicherte RSS-Funde."""
+    if rss_monitor is None or not hasattr(rss_monitor, "generate_weekly_rss_synthesis"):
+        return "❌ Fehler: Synthese-Funktion (rss_monitor) nicht verfügbar."
+    cfg = assistant.load_config() if assistant is not None else {}
+    token = os.environ.get("NOTION_TOKEN", "").strip()
+    notion = NotionClient(token) if token else None
+    html_out, _ = rss_monitor.generate_weekly_rss_synthesis(cfg=cfg, store=get_store(), notion=notion, days=7)
+    return html_out
 
 
 def handle_status(chat_id: str) -> str:
-    """Gibt Systemstatus, Anzahl Einträge und Zeitpläne aus."""
+    """Gibt Systemstatus, Anzahl Einträge, Feed-Health und Zeitpläne aus."""
+    esc = telegram_ui.esc
     cfg = load_feeds_config()
     topics = cfg.get("topics", [])
     active_cnt = sum(1 for t in topics if t.get("enabled", True))
     paused_cnt = len(topics) - active_cnt
 
-    # Letzter Lauf aus Digest oder Wissensspeicher
     all_pages = query_notion_knowledge(page_size=1)
     last_entry = "Unbekannt"
     if all_pages:
@@ -447,7 +484,7 @@ def handle_status(chat_id: str) -> str:
             last_entry = created[:16].replace("T", " ")
 
     rss_st = load_rss_state()
-    seen_cnt = len(rss_st.get("seen", {})) // 2  # Link + Title Hash pro Eintrag
+    seen_cnt = len(rss_st.get("seen", {})) // 2
 
     import platform as _plat
     _host = _plat.node() or "unknown"
@@ -458,15 +495,23 @@ def handle_status(chat_id: str) -> str:
             _commit = _cproc.stdout.strip()
     except Exception:
         pass
-    _env_label = f"`{sys.platform}` @ `{_host}` (PID `{os.getpid()}`" + (f", Commit `{_commit}`" if _commit else "") + ")"
+    _env_label = f"<code>{esc(sys.platform)}</code> @ <code>{esc(_host)}</code> (PID <code>{os.getpid()}</code>" + (
+        f", Commit <code>{esc(_commit)}</code>" if _commit else ""
+    ) + ")"
 
     lines = [
-        "📊 *Wissensspeicher- & RSS-Status:*\n",
-        f"• 🖥️ *Host:* {_env_label}",
-        f"• Themen: *{active_cnt} aktiv*, {paused_cnt} pausiert",
-        f"• Gesehene Artikel im Cache: *{seen_cnt}*",
-        f"• Letzter Notion-Eintrag: *{last_entry}*",
+        "📊 <b>Wissensspeicher- & RSS-Status:</b>\n",
+        f"• 🖥️ <b>Host:</b> {_env_label}",
+        f"• Themen: <b>{active_cnt} aktiv</b>, {paused_cnt} pausiert",
+        f"• Gesehene Artikel im Cache: <b>{seen_cnt}</b>",
+        f"• Letzter Notion-Eintrag: <b>{esc(last_entry)}</b>",
     ]
+
+    degraded = get_store().get_degraded_feeds()
+    if degraded:
+        lines.append(f"• ⚠️ <b>Degradierte Feeds:</b> {len(degraded)} (Circuit Breaker)")
+        for df in degraded[:3]:
+            lines.append(f"   ↳ {esc(df.get('source_name', '?'))}: {df.get('fail_count', 0)} Fehler")
 
     sched_lines = []
     if assistant is not None:
@@ -474,46 +519,50 @@ def handle_status(chat_id: str) -> str:
             sched_st = assistant._load_scheduler_state()
             now_berlin = assistant._scheduler_now("Europe/Berlin")
             time_str = now_berlin.strftime("%H:%M Uhr (%d.%m.%Y)")
-            sched_lines.append(f"🕒 *Serverzeit (Berlin):* {time_str}")
+            sched_lines.append(f"🕒 <b>Serverzeit (Berlin):</b> {esc(time_str)}")
             job_names = {
                 "rss_morning": "📰 RSS-Monitor Morgen (07:30 Uhr)",
                 "briefing_morning": "☀️ Morgen-Briefing (08:00 Uhr)",
                 "rss_evening": "📰 RSS-Monitor Abend (18:30 Uhr)",
                 "briefing_evening": "🌙 Abend-Briefing (19:30 Uhr)",
+                "weekly_synthesis": "🧠 Wochen-Synthese (So 18:15 Uhr)",
             }
             for jid, jlabel in job_names.items():
                 last = sched_st.get(jid, "noch nicht gelaufen")
-                sched_lines.append(f"• *{jlabel}*\n   ↳ Zuletzt: `{last}`")
+                sched_lines.append(f"• <b>{jlabel}</b>\n   ↳ Zuletzt: <code>{esc(last)}</code>")
         except Exception:
             pass
 
     if sched_lines:
-        lines.extend(["", "⏰ *Automatischer Zeitplan & Status:*"] + sched_lines)
+        lines.extend(["", "⏰ <b>Automatischer Zeitplan &amp; Status:</b>"] + sched_lines)
     else:
         lines.extend([
             "",
-            "⏰ *Automatischer Zeitplan (im Daemon integriert, Europe/Berlin):*",
-            "• Morgens: *07:30 Uhr* (RSS) | *08:00 Uhr* (Briefing)",
-            "• Abends: *18:30 Uhr* (RSS) | *19:30 Uhr* (Briefing)",
+            "⏰ <b>Automatischer Zeitplan (im Daemon integriert, Europe/Berlin):</b>",
+            "• Morgens: <b>07:30 Uhr</b> (RSS) | <b>08:00 Uhr</b> (Briefing)",
+            "• Abends: <b>18:30 Uhr</b> (RSS) | <b>19:30 Uhr</b> (Briefing)",
         ])
 
     if _rss_monitor_import_error:
         lines.extend([
             "",
-            f"⚠️ _Hinweis: rss_monitor Modul: {_rss_monitor_import_error}_",
-            "_(Tipp: Auf dem Server `pip install -r requirements.txt` ausführen)_",
+            f"⚠️ <i>Hinweis: rss_monitor Modul: {esc(_rss_monitor_import_error)}</i>",
+            "<i>(Tipp: Auf dem Server <code>pip install -r requirements.txt</code> ausführen)</i>",
         ])
 
     lines.extend([
         "",
-        "🔗 [Wissensspeicher in Notion öffnen](https://app.notion.com/p/c7bac0f9b2224aa6a0b42510fb987b7b)",
+        '🔗 <a href="https://app.notion.com/p/c7bac0f9b2224aa6a0b42510fb987b7b">Wissensspeicher in Notion öffnen</a>',
     ])
     return "\n".join(lines)
 
 
 def handle_natural_language(chat_id: str, text: str, token: str) -> None:
-    """Behandelt Freitext-Fragen oder Notizen mit schnellem Jev-Choice-Router und Gemini-Tiering."""
+    """Behandelt Freitext-Fragen mit Jev-Choice-Router, Multi-Turn-Memory und Gemini-Tiering."""
     import jev_client
+
+    store = get_store()
+    store.append_chat_turn("rss", chat_id, "user", text)
 
     # 1. Jev-Choice Intent-Router (schnell, günstig, deterministisch ohne Textgenerierung)
     jclient = jev_client.JevClient()
@@ -524,6 +573,7 @@ def handle_natural_language(chat_id: str, text: str, token: str) -> None:
                 "deals": "Fragen zu Studenten- oder Dozenten-Rabatten, Aktionen, Deals, Freebies",
                 "suche": "Suche nach Begriffen, Studien oder Artikeln im Wissensspeicher",
                 "themen": "Übersicht, Aktivierung oder Verwaltung von RSS-Themen",
+                "synthese": "Zusammenfassung oder Wochen-Synthese über alle Themen hinweg",
                 "run": "Suchlauf manuell starten oder aktualisieren",
                 "general_question": "Freie inhaltliche Frage zu den Forschungsthemen oder Feedback",
             }
@@ -535,20 +585,33 @@ def handle_natural_language(chat_id: str, text: str, token: str) -> None:
             )
             if conf >= 0.70:
                 if choice == "covid":
-                    send_message(token, chat_id, handle_covid(chat_id))
+                    reply = handle_covid(chat_id)
+                    send_message(token, chat_id, reply)
+                    store.append_chat_turn("rss", chat_id, "assistant", reply[:400])
                     return
                 elif choice == "deals":
-                    send_message(token, chat_id, handle_deals(chat_id))
+                    reply = handle_deals(chat_id)
+                    send_message(token, chat_id, reply)
+                    store.append_chat_turn("rss", chat_id, "assistant", reply[:400])
                     return
                 elif choice == "themen":
-                    send_message(token, chat_id, handle_themen(chat_id))
+                    reply = handle_themen(chat_id)
+                    send_message(token, chat_id, reply)
+                    store.append_chat_turn("rss", chat_id, "assistant", reply[:400])
+                    return
+                elif choice == "synthese":
+                    reply = handle_synthese(chat_id)
+                    send_message(token, chat_id, reply)
+                    store.append_chat_turn("rss", chat_id, "assistant", reply[:400])
                     return
                 elif choice == "run":
                     handle_run_async(chat_id, token)
                     return
                 elif choice == "suche":
                     clean_q = re.sub(r"(?i)^(suche|finde|zeig mir)\s+", "", text).strip()
-                    send_message(token, chat_id, handle_suche(chat_id, clean_q or text))
+                    reply = handle_suche(chat_id, clean_q or text)
+                    send_message(token, chat_id, reply)
+                    store.append_chat_turn("rss", chat_id, "assistant", reply[:400])
                     return
         except Exception as jexc:
             log.warning("Jev RSS-Bot Router Fehler (%s) – nutze Heuristik.", jexc)
@@ -556,30 +619,48 @@ def handle_natural_language(chat_id: str, text: str, token: str) -> None:
     # 2. Deterministische Heuristik als Fallback
     lower = text.lower()
     if any(k in lower for k in ["covid", "corona", "infiziert", "zahlen", "inzidenz"]):
-        send_message(token, chat_id, handle_covid(chat_id))
+        reply = handle_covid(chat_id)
+        send_message(token, chat_id, reply)
+        store.append_chat_turn("rss", chat_id, "assistant", reply[:400])
         return
     if any(k in lower for k in ["rabatt", "deal", "student", "dozent", "kostenlos", "freebie"]):
-        send_message(token, chat_id, handle_deals(chat_id))
+        reply = handle_deals(chat_id)
+        send_message(token, chat_id, reply)
+        store.append_chat_turn("rss", chat_id, "assistant", reply[:400])
+        return
+    if "synthese" in lower or "wochenrückblick" in lower:
+        reply = handle_synthese(chat_id)
+        send_message(token, chat_id, reply)
+        store.append_chat_turn("rss", chat_id, "assistant", reply[:400])
         return
     if lower.startswith("suche ") or lower.startswith("such "):
         q = re.sub(r"^suche?\s+", "", text, flags=re.IGNORECASE)
-        send_message(token, chat_id, handle_suche(chat_id, q))
+        reply = handle_suche(chat_id, q)
+        send_message(token, chat_id, reply)
+        store.append_chat_turn("rss", chat_id, "assistant", reply[:400])
         return
 
-    # 3. Mit Gemini 3.5 Flash-Lite (Tier 'chat_simple', thinking=minimal) oder Ollama beantworten
+    # 3. Mit Multi-Turn-Verlauf + lokalen Wissens-Hits an Gemini/Ollama übergeben
     if assistant is not None:
         try:
             cfg = assistant.load_config()
+            history = store.get_recent_chat_turns("rss", chat_id, limit=6)
+            history_block = "\n".join(f"{h['role'].upper()}: {h['content'][:250]}" for h in history[:-1])
+            local_ctx = store.search_knowledge_bm25(text, limit=3)
+            ctx_block = "\n".join(
+                f"- [{c.get('topic_id')}] {c.get('title')}: {(c.get('summary') or '')[:160]}"
+                for c in local_ctx
+            )
             prompt = (
-                "Du bist der wissenschaftliche RSS- und Wissensspeicher-Assistent von Stefan. "
-                "Stefan schickt dir folgende Nachricht auf Telegram:\n"
-                f"\"{text}\"\n\n"
-                "Antworte Stefan präzise, freundlich und sachlich auf Deutsch. "
-                "Wenn er nach neuen Erkenntnissen oder Studien zu Parkinson, Long COVID, ME/CFS "
-                "oder Rabatten fragt, erkläre kurz die Relevanz oder verweise auf die Befehle /suche, /themen oder /run."
+                "Du bist der wissenschaftliche RSS- und Wissensspeicher-Assistent von Stefan.\n"
+                + (f"Letzter Gesprächsverlauf:\n{history_block}\n\n" if history_block else "")
+                + (f"Passende Wissensspeicher-Treffer:\n{ctx_block}\n\n" if ctx_block else "")
+                + f"Aktuelle Nachricht von Stefan:\n\"{text}\"\n\n"
+                "Antworte Stefan präzise, freundlich und sachlich auf Deutsch (nutze optional HTML-Tags wie <b> oder <i>, kein Markdown)."
             )
             reply = assistant.call_llm_text(prompt, cfg, task="chat_simple")
             send_message(token, chat_id, reply)
+            store.append_chat_turn("rss", chat_id, "assistant", reply[:500])
             return
         except Exception as exc:
             log.warning("Fehler bei LLM-Antwort: %s", exc)
@@ -587,8 +668,106 @@ def handle_natural_language(chat_id: str, text: str, token: str) -> None:
     send_message(
         token,
         chat_id,
-        "Ich habe deine Nachricht erhalten. Nutze `/themen` für die Übersicht oder `/help` für alle Befehle.",
+        "Ich habe deine Nachricht erhalten. Nutze <code>/themen</code> für die Übersicht oder <code>/help</code> für alle Befehle.",
     )
+
+
+# --------------------------------------------------------------------------------------
+# Inline-Button Callback-Handler
+# --------------------------------------------------------------------------------------
+
+def handle_callback_query(token: str, cb: dict[str, Any], state: dict[str, Any]) -> None:
+    """Verarbeitet Inline-Buttons aus RSS-Benachrichtigungen (Task, Idee, Irrelevant)."""
+    cb_id = str(cb.get("id") or "")
+    data = str(cb.get("data") or "")
+    msg = cb.get("message") or {}
+    chat_id = str(msg.get("chat", {}).get("id", ""))
+
+    if not chat_id or not telegram_ui.is_authorized_chat(
+        chat_id,
+        env_keys=("TELEGRAM_RSS_CHAT_ID", "TELEGRAM_CHAT_ID", "TELEGRAM_ALLOWED_USERS"),
+    ):
+        telegram_ui.answer_callback_query(token, cb_id, "⛔ Nicht autorisiert.", show_alert=True)
+        return
+
+    if ":" not in data:
+        telegram_ui.answer_callback_query(token, cb_id, "Unbekannte Aktion.")
+        return
+
+    action, tok = data.split(":", 1)
+    store = get_store()
+    entry = store.get_callback_payload(tok)
+    if not entry:
+        telegram_ui.answer_callback_query(token, cb_id, "Dieser Button ist abgelaufen.", show_alert=True)
+        return
+
+    _, payload = entry
+    title = payload.get("title", "RSS-Fund")
+    link = payload.get("link", "")
+    topic_id = payload.get("topic_id", "")
+    summary = payload.get("summary", "")
+
+    if action == "rss_bad":
+        store.add_rss_feedback(topic_id=topic_id, title=title, link=link, feedback="irrelevant")
+        telegram_ui.answer_callback_query(token, cb_id, "👎 Gemerkt – Filter lernt dazu!")
+        send_message(
+            token,
+            chat_id,
+            f"👎 <b>Feedback gespeichert:</b> „{telegram_ui.esc(title[:90])}“ wird künftig für Thema <code>{telegram_ui.esc(topic_id)}</code> als negatives Beispiel berücksichtigt.",
+        )
+        return
+
+    if action in ("rss_task", "rss_idea"):
+        notion_tok = os.environ.get("NOTION_TOKEN", "").strip()
+        area = agent_tools.detect_area(f"{topic_id} {title} {summary}")
+        if notion_tok and assistant is not None:
+            try:
+                cfg = assistant.load_config()
+                notion = NotionClient(notion_tok)
+                if action == "rss_task":
+                    page_id = notion.create_task_page(
+                        tasks_db_id=cfg["notion"]["tasks_database_id"],
+                        title=f"Prüfen: {title[:70]}",
+                        kind="To-Do",
+                        priority="Mittel",
+                        due_date=None,
+                        next_step=f"Artikel/Studie lesen: {link}" if link else summary[:160],
+                        area=area,
+                        estimated_minutes=20,
+                    )
+                    store.push_undo("rss", chat_id, "archive_task", {"notion_page_id": page_id, "title": title})
+                    telegram_ui.answer_callback_query(token, cb_id, "📌 Als Notion-Task gespeichert!")
+                    send_message(
+                        token,
+                        chat_id,
+                        f"📌 <b>Aufgabe angelegt:</b> {telegram_ui.esc(title[:80])}\n<i>Bereich:</i> {telegram_ui.esc(area)}",
+                    )
+                else:
+                    page_id = notion.create_task_page(
+                        tasks_db_id=cfg["notion"]["tasks_database_id"],
+                        title=f"Idee: {title[:70]}",
+                        kind="KI-Vorschlag / Idee",
+                        priority="Niedrig",
+                        due_date=None,
+                        next_step=f"Quelle: {link}" if link else summary[:160],
+                        area=area,
+                    )
+                    store.push_undo("rss", chat_id, "archive_task", {"notion_page_id": page_id, "title": title})
+                    telegram_ui.answer_callback_query(token, cb_id, "🎬 Als Idee in Notion gespeichert!")
+                    send_message(
+                        token,
+                        chat_id,
+                        f"🎬 <b>Idee vorgemerkt:</b> {telegram_ui.esc(title[:80])}",
+                    )
+                return
+            except Exception as exc:
+                log.warning("RSS-Button Notion-Erstellung fehlgeschlagen: %s", exc)
+
+        telegram_ui.answer_callback_query(token, cb_id, "ℹ️ Notion nicht aktiv – nur lokal vorgemerkt.")
+        send_message(token, chat_id, f"📌 Vorgemerkt ({telegram_ui.esc(action)}): {telegram_ui.esc(title)}")
+        return
+
+    telegram_ui.answer_callback_query(token, cb_id, "Unbekannte Aktion.")
 
 
 # --------------------------------------------------------------------------------------
@@ -596,7 +775,7 @@ def handle_natural_language(chat_id: str, text: str, token: str) -> None:
 # --------------------------------------------------------------------------------------
 
 def process_updates(token: str, state: dict[str, Any], poll_timeout: int = 15) -> int:
-    """Fragt neue Telegram-Nachrichten via Long-Polling ab."""
+    """Fragt neue Telegram-Nachrichten & Callbacks via Long-Polling ab."""
     offset = int(state.get("rss_telegram_offset", 0))
     api_base = f"https://api.telegram.org/bot{token}"
 
@@ -620,12 +799,27 @@ def process_updates(token: str, state: dict[str, Any], poll_timeout: int = 15) -
         save_rss_state(state)
         count += 1
 
+        if "callback_query" in update:
+            try:
+                handle_callback_query(token, update["callback_query"], state)
+            except Exception as exc:
+                log.exception("Fehler bei Callback-Query in Update %s: %s", update_id, exc)
+            continue
+
         msg = update.get("message") or update.get("edited_message")
         if not msg:
             continue
 
         chat_id = str(msg.get("chat", {}).get("id", ""))
         if not chat_id:
+            continue
+
+        # Autorisierung VOR jeglicher State-Mutation oder Befehlsausführung prüfen
+        if not telegram_ui.is_authorized_chat(
+            chat_id,
+            env_keys=("TELEGRAM_RSS_CHAT_ID", "TELEGRAM_CHAT_ID", "TELEGRAM_ALLOWED_USERS"),
+        ):
+            log.warning("Unautorisierter RSS-Bot-Zugriff von Chat-ID %s blockiert.", chat_id)
             continue
 
         try:
@@ -637,39 +831,76 @@ def process_updates(token: str, state: dict[str, Any], poll_timeout: int = 15) -
 
             raw_text = (msg.get("text") or "").strip()
             voice = msg.get("voice") or msg.get("audio")
+            doc = msg.get("document")
 
             # Sprachnachricht transkribieren
             if voice and assistant is not None:
                 file_id = voice.get("file_id")
                 if file_id:
-                    try:
-                        f_req = urllib.request.Request(f"{api_base}/getFile?file_id={file_id}")
-                        with urllib.request.urlopen(f_req, timeout=15) as f_resp:
-                            f_info = json.loads(f_resp.read().decode("utf-8"))
-                            f_path = f_info.get("result", {}).get("file_path")
-                        if f_path:
-                            dl_url = f"https://api.telegram.org/file/bot{token}/{f_path}"
-                            tmp_audio = BASE_DIR / "temp" / f"voice_{int(time.time())}.ogg"
-                            tmp_audio.parent.mkdir(parents=True, exist_ok=True)
-                            with urllib.request.urlopen(dl_url, timeout=30) as dl, open(tmp_audio, "wb") as out:
-                                out.write(dl.read())
+                    tmp_audio = telegram_ui.download_telegram_file(token, file_id, BASE_DIR / "temp", prefix="voice")
+                    if tmp_audio:
+                        try:
                             cfg = assistant.load_config()
                             raw_text = assistant.transcribe_audio(tmp_audio, cfg)
-                            send_message(token, chat_id, f"🎤 _Erkannt:_ „{raw_text}“")
+                            send_message(token, chat_id, f"🎤 <i>Erkannt:</i> „{telegram_ui.esc(raw_text)}“")
+                        except Exception as exc:
+                            log.warning("Fehler bei Audio-Transkription: %s", exc)
+                        finally:
                             try:
                                 tmp_audio.unlink()
                             except Exception:
                                 pass
-                    except Exception as exc:
-                        log.warning("Fehler bei Audio-Download/Transkription: %s", exc)
+
+            # Dokument-Upload (PDF/TXT/MD -> Studienanalyse)
+            if doc and not raw_text:
+                file_id = doc.get("file_id")
+                mime = doc.get("mime_type") or "application/pdf"
+                fname = doc.get("file_name") or "dokument"
+                caption = (msg.get("caption") or "").strip()
+                if file_id and (mime == "application/pdf" or fname.lower().endswith((".pdf", ".txt", ".md"))):
+                    tmp_doc = telegram_ui.download_telegram_file(token, file_id, BASE_DIR / "temp", prefix="doc")
+                    if tmp_doc:
+                        try:
+                            cfg = assistant.load_config() if assistant is not None else {}
+                            if fname.lower().endswith((".txt", ".md")):
+                                txt_content = tmp_doc.read_text(encoding="utf-8", errors="replace")[:4000]
+                                handle_natural_language(chat_id, f"{caption}\n\nDokument ({fname}):\n{txt_content}", token)
+                            else:
+                                ref = assistant.get_date_reference_block() if assistant is not None else ""
+                                res_mm = agent_tools.analyze_multimodal_file(tmp_doc, mime, caption, cfg, ref)
+                                send_message(
+                                    token,
+                                    chat_id,
+                                    f"📄 <b>{telegram_ui.esc(res_mm.get('title', fname))}</b>\n\n"
+                                    f"{telegram_ui.esc(res_mm.get('summary', ''))}\n"
+                                    f"<i>Bereich: {telegram_ui.esc(res_mm.get('area', ''))}</i>",
+                                )
+                                notion_tok = os.environ.get("NOTION_TOKEN", "").strip()
+                                if notion_tok and assistant is not None:
+                                    NotionClient(notion_tok).create_inbox_page(
+                                        inbox_db_id=cfg["notion"]["inbox_database_id"],
+                                        title=res_mm.get("title", fname),
+                                        source="Telegram PDF",
+                                        raw_text=res_mm.get("raw_text", ""),
+                                        summary=res_mm.get("summary", ""),
+                                        suggestions_text="",
+                                        area=res_mm.get("area"),
+                                    )
+                        except Exception as exc:
+                            log.warning("Fehler bei Dokument-Verarbeitung: %s", exc)
+                            send_message(token, chat_id, f"❌ Dokument konnte nicht analysiert werden: {telegram_ui.esc(exc)}")
+                        finally:
+                            try:
+                                tmp_doc.unlink()
+                            except Exception:
+                                pass
+                        continue
 
             if not raw_text:
                 continue
 
             log.info("Empfangen von %s: %s", chat_id, raw_text[:60])
 
-            # Befehle auswerten
-            lower = raw_text.strip().lower()
             parts = raw_text.strip().split()
             cmd = parts[0].lower().split("@")[0]  # strip @RSS8472Bot
             arg = " ".join(parts[1:]).strip()
@@ -688,6 +919,8 @@ def process_updates(token: str, state: dict[str, Any], poll_timeout: int = 15) -
                 send_message(token, chat_id, handle_loeschen(chat_id, arg))
             elif cmd in ("/run", "/sync", "sync", "run"):
                 handle_run_async(chat_id, token)
+            elif cmd in ("/synthese", "/synthesis", "synthese"):
+                send_message(token, chat_id, handle_synthese(chat_id))
             elif cmd in ("/covid", "/corona", "covid"):
                 send_message(token, chat_id, handle_covid(chat_id))
             elif cmd in ("/deals", "/rabatte", "deals", "rabatte"):
@@ -710,7 +943,7 @@ def process_updates(token: str, state: dict[str, Any], poll_timeout: int = 15) -
         except Exception as exc:
             log.exception("Fehler bei Verarbeitung von Nachricht aus Update %s: %s", update_id, exc)
             try:
-                send_message(token, chat_id, f"❌ Ein interner Fehler ist aufgetreten: {exc}")
+                send_message(token, chat_id, f"❌ Ein interner Fehler ist aufgetreten: {telegram_ui.esc(exc)}")
             except Exception:
                 pass
 
@@ -724,6 +957,7 @@ def run_bot_daemon(poll_timeout: int = 15) -> None:
         log.error("Kein Telegram-Bot-Token konfiguriert (TELEGRAM_RSSBOT_TOKEN oder TELEGRAM_BOT_TOKEN fehlt).")
         return
 
+    telegram_ui.register_bot_commands(token, telegram_ui.RSS_BOT_COMMANDS)
     log.info("RSS-Bot Daemon gestartet (Token: %s...). Warte auf Nachrichten...", token[:10])
     while True:
         try:

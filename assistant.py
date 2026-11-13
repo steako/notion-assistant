@@ -25,6 +25,8 @@ import email
 from email.header import decode_header
 import imaplib
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 import os
 import re
 import shutil
@@ -40,6 +42,10 @@ from urllib import error, request
 import chat_guard
 import jev_client
 import llm_core
+from core import agent_tools
+from core.storage import StateStore, atomic_write_json, safe_read_json
+from integrations import calendar_sync, telegram_ui
+from integrations.notion_client import NotionClient
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
@@ -47,6 +53,46 @@ ENV_PATH = BASE_DIR / ".env"
 
 AUDIO_EXTENSIONS = {".mp3", ".m4a", ".wav", ".ogg", ".opus", ".flac"}
 TEXT_EXTENSIONS = {".txt", ".md"}
+
+log = logging.getLogger("assistant")
+_LOGGING_INITIALIZED = False
+_STORE_CACHE: dict[str, StateStore] = {}
+
+
+def setup_logging(log_file: Path | None = None) -> None:
+    """Konfiguriert rotierendes Datei-Logging (assistant.log) + Konsolenausgabe."""
+    global _LOGGING_INITIALIZED
+    if _LOGGING_INITIALIZED:
+        return
+    target = log_file or (BASE_DIR / "assistant.log")
+    root = logging.getLogger()
+    if not root.handlers:
+        root.setLevel(logging.INFO)
+        fmt = logging.Formatter("%(asctime)s [%(levelname)s] [%(name)s] %(message)s", "%Y-%m-%d %H:%M:%S")
+        stream_h = logging.StreamHandler()
+        stream_h.setFormatter(fmt)
+        root.addHandler(stream_h)
+        try:
+            rot_h = RotatingFileHandler(target, maxBytes=2_000_000, backupCount=4, encoding="utf-8")
+            rot_h.setFormatter(fmt)
+            root.addHandler(rot_h)
+        except Exception:
+            pass
+    _LOGGING_INITIALIZED = True
+
+
+def get_store(db_path: Path | None = None) -> StateStore:
+    """Gibt die thread-sichere SQLite-StateStore-Instanz zurück."""
+    target = db_path or Path(os.environ.get("ASSISTANT_DB_PATH") or (BASE_DIR / "assistant.db"))
+    key = str(target.resolve())
+    if key not in _STORE_CACHE:
+        st = StateStore(target)
+        try:
+            st.migrate_from_legacy_json(BASE_DIR)
+        except Exception:
+            pass
+        _STORE_CACHE[key] = st
+    return _STORE_CACHE[key]
 
 
 def load_dotenv_file(env_path: Path) -> None:
@@ -71,19 +117,17 @@ def load_config() -> dict[str, Any]:
 
 
 def load_local_state(state_path: Path) -> dict[str, Any]:
-    if state_path.exists():
-        try:
-            return json.loads(state_path.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {"items": [], "tasks": [], "telegram_offset": 0}
+    data = safe_read_json(state_path, {"items": [], "tasks": [], "telegram_offset": 0})
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("items", [])
+    data.setdefault("tasks", [])
+    data.setdefault("telegram_offset", 0)
+    return data
 
 
 def save_local_state(state_path: Path, state: dict[str, Any]) -> None:
-    state_path.write_text(
-        json.dumps(state, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    atomic_write_json(state_path, state, indent=2)
 
 
 def get_date_reference_block() -> str:
@@ -369,13 +413,15 @@ def analyze_note(
 Analysiere die folgende Notiz / Sprachnachricht von Stefan Kollmeier und extrahiere strukturiert:
 1. "title": Einen kurzen, prägnanten Titel (max. 60 Zeichen), falls der bisherige Titel generisch ist.
 2. "summary": Eine kurze Zusammenfassung (1-2 Sätze auf fehlerfreiem Deutsch).
-3. "todos": Eine Liste konkreter Aufgaben (To-Dos), die erledigt werden müssen (für die Notion-Aufgabenliste).
+3. "area": Passender Lebensbereich – genau einer von: "Hochschule/Lehre", "Life on Pause", "Gesundheit/Forschung", "Familie/Privat", "Finanzen/Orga".
+4. "todos": Eine Liste konkreter Aufgaben (To-Dos), die erledigt werden müssen (für die Notion-Aufgabenliste).
    Jedes To-Do hat:
    - "title": Kurze Aufgabenbeschreibung (präzise auf Deutsch)
    - "priority": "Hoch", "Mittel" oder "Niedrig"
    - "due_date": Konkretes Fälligkeitsdatum im Format "YYYY-MM-DD" (berechne relative Angaben wie "morgen", "Mittwoch", "nächste Woche", "Sonntag" EXAKT anhand der obigen Kalender-Referenztabelle) oder null, wenn kein Datum genannt ist.
    - "next_step": Konkreter erster Arbeitsschritt (1 Satz).
-4. "calendar_events": Eine Liste echter Kalendertermine mit festem Zeitpunkt/Zeitblock (z. B. Besprechung um 14 Uhr, Vorlesung, Arzttermin, Fokusblock 19-20 Uhr, Geburtstag).
+   - "estimated_minutes": Realistische geschätzte Dauer in Minuten (Ganzzahl, z. B. 15, 30, 60, 90).
+5. "calendar_events": Eine Liste echter Kalendertermine mit festem Zeitpunkt/Zeitblock (z. B. Besprechung um 14 Uhr, Vorlesung, Arzttermin, Fokusblock 19-20 Uhr, Geburtstag).
    WICHTIGE ABGRENZUNG ZWISCHEN TODOS UND CALENDAR_EVENTS (KEINE DUPLIKATE!):
    - Eine allgemeine Aufgabe oder Besorgung an einem Tag ohne feste Uhrzeit (z. B. "Erinnere mich daran, am Mittwoch eine Überweisung zu holen" oder "Nächste Woche ETF-Anlage mit Frau machen") gehört NUR in "todos" (mit "due_date"), NIEMALS zusätzlich in "calendar_events"!
    - Ein Termin mit Uhrzeit oder ein echtes ganztägiges Ereignis gehört in "calendar_events", und dann NICHT nochmal als identisches To-Do in "todos"!
@@ -387,7 +433,7 @@ Analysiere die folgende Notiz / Sprachnachricht von Stefan Kollmeier und extrahi
    - "end_time": Enduhrzeit im Format "HH:MM" (Standard: 1 Stunde nach start_time, z. B. "12:00") oder null
    - "location": Ort / Raum (oder "")
    - "description": Kurzer Kontext zum Termin
-5. "suggestions": 1 bis 2 hilfreiche, konkret umsetzbare Impulse / Ideen zur Notiz.
+6. "suggestions": 1 bis 2 hilfreiche, konkret umsetzbare Impulse / Ideen zur Notiz.
    Jeder Vorschlag hat:
    - "title": Kurzer Titel des Vorschlags
    - "priority": "Mittel" oder "Niedrig"
@@ -403,8 +449,9 @@ Gib genau dieses JSON-Schema zurück:
 {{
   "title": "...",
   "summary": "...",
+  "area": "Hochschule/Lehre | Life on Pause | Gesundheit/Forschung | Familie/Privat | Finanzen/Orga",
   "todos": [
-    {{"title": "...", "priority": "Hoch|Mittel|Niedrig", "due_date": "YYYY-MM-DD oder null", "next_step": "..."}}
+    {{"title": "...", "priority": "Hoch|Mittel|Niedrig", "due_date": "YYYY-MM-DD oder null", "next_step": "...", "estimated_minutes": 30}}
   ],
   "calendar_events": [
     {{"title": "...", "date": "YYYY-MM-DD", "start_time": "HH:MM oder null", "end_time": "HH:MM oder null", "location": "...", "description": "..."}}
@@ -417,11 +464,9 @@ Gib genau dieses JSON-Schema zurück:
     result = call_llm_json(prompt, cfg, model_override=model_override)
     todos = result.get("todos") or []
     cal_events = result.get("calendar_events") or []
+    note_area = result.get("area") or agent_tools.detect_area(f"{title} {text}")
 
     # Sicherheits-Deduplizierung: Falls das LLM denselben Punkt trotzdem in todos UND calendar_events packt:
-    # - Hat der Kalendereintrag KEINE Uhrzeit (start_time is None) und existiert ein ähnliches To-Do am selben Tag,
-    #   behalten wir nur das To-Do (mit due_date).
-    # - Hat der Kalendereintrag eine feste Uhrzeit (start_time gesetzt), behalten wir den Kalendereintrag.
     filtered_cal: list[dict[str, Any]] = []
     filtered_todos = list(todos)
 
@@ -437,18 +482,24 @@ Gib genau dieses JSON-Schema zurück:
                 break
         if overlapping_todo is not None:
             if not ev_start:
-                # Ganztägige "Erinnerung" ist bereits als To-Do mit Fälligkeitsdatum erfasst -> kein doppelter Kalendereintrag
                 if not overlapping_todo.get("due_date") and ev_date:
                     overlapping_todo["due_date"] = ev_date
                 continue
             else:
-                # Echter Uhrzeit-Termin -> aus To-Dos entfernen, damit er nur im Kalender steht
                 filtered_todos = [t for t in filtered_todos if t is not overlapping_todo]
         filtered_cal.append(ev)
+
+    for td in filtered_todos:
+        td.setdefault("area", note_area)
+        try:
+            td["estimated_minutes"] = max(10, int(td.get("estimated_minutes") or 30))
+        except Exception:
+            td["estimated_minutes"] = 30
 
     return {
         "title": result.get("title") or title,
         "summary": result.get("summary") or "",
+        "area": note_area,
         "todos": filtered_todos,
         "calendar_events": filtered_cal,
         "suggestions": result.get("suggestions") or [],
@@ -466,565 +517,27 @@ def analyze_note_with_ollama(
     return analyze_note(title, text, cfg, model_override=model_override)
 
 
-class NotionClient:
-    """Leichtgewichtiger Notion-API-Client für den lokalen Hintergrundbetrieb."""
-
-    def __init__(self, token: str) -> None:
-        self.token = token
-        self.base_url = "https://api.notion.com/v1"
-        self.headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "Notion-Version": "2022-06-28",
-        }
-
-    def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        data = json.dumps(payload).encode("utf-8") if payload is not None else None
-        req = request.Request(
-            f"{self.base_url}{path}",
-            data=data,
-            headers=self.headers,
-            method=method,
-        )
-        try:
-            with request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except error.HTTPError as exc:
-            details = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Notion API Fehler ({exc.code}): {details}") from exc
-
-    def query_new_inbox_items(self, inbox_db_id: str) -> list[dict[str, Any]]:
-        payload = {
-            "filter": {
-                "property": "Status",
-                "status": {"equals": "Neu"},
-            }
-        }
-        res = self._request("POST", f"/databases/{inbox_db_id}/query", payload)
-        return res.get("results", [])
-
-    def get_page_blocks_text(self, page_id: str) -> str:
-        res = self._request("GET", f"/blocks/{page_id}/children?page_size=50")
-        lines: list[str] = []
-        for block in res.get("results", []):
-            btype = block.get("type", "")
-            bdata = block.get(btype, {})
-            rich = bdata.get("rich_text", [])
-            text = "".join(rt.get("plain_text", "") for rt in rich).strip()
-            if text:
-                lines.append(text)
-        return "\n".join(lines).strip()
-
-    def create_inbox_page(
-        self,
-        inbox_db_id: str,
-        title: str,
-        source: str,
-        raw_text: str,
-        summary: str,
-        suggestions_text: str,
-    ) -> str:
-        payload: dict[str, Any] = {
-            "parent": {"database_id": inbox_db_id},
-            "icon": {"type": "emoji", "emoji": "🎙️"},
-            "properties": {
-                "Name": {"title": [{"text": {"content": title[:100]}}]},
-                "Status": {"status": {"name": "Ausgewertet"}},
-                "Quelle": {"select": {"name": source}},
-                "Transkript": {"rich_text": [{"text": {"content": raw_text[:1900]}}]},
-                "Zusammenfassung": {"rich_text": [{"text": {"content": summary[:1900]}}]},
-                "Vorschlaege": {"rich_text": [{"text": {"content": suggestions_text[:1900]}}]},
-            },
-        }
-        res = self._request("POST", "/pages", payload)
-        return res["id"]
-
-    def update_inbox_page(
-        self,
-        page_id: str,
-        raw_text: str,
-        summary: str,
-        suggestions_text: str,
-    ) -> None:
-        payload: dict[str, Any] = {
-            "properties": {
-                "Status": {"status": {"name": "Ausgewertet"}},
-                "Transkript": {"rich_text": [{"text": {"content": raw_text[:1900]}}]},
-                "Zusammenfassung": {"rich_text": [{"text": {"content": summary[:1900]}}]},
-                "Vorschlaege": {"rich_text": [{"text": {"content": suggestions_text[:1900]}}]},
-            }
-        }
-        self._request("PATCH", f"/pages/{page_id}", payload)
-
-    def create_task_page(
-        self,
-        tasks_db_id: str,
-        title: str,
-        kind: str,
-        priority: str,
-        due_date: str | None,
-        next_step: str,
-        inbox_page_id: str | None = None,
-    ) -> str:
-        props: dict[str, Any] = {
-            "Aufgabenbezeichnung": {"title": [{"text": {"content": title[:100]}}]},
-            "Status": {"status": {"name": "Nicht begonnen"}},
-            "Art": {"select": {"name": kind}},
-            "Prioritaet": {"select": {"name": priority if priority in ("Hoch", "Mittel", "Niedrig") else "Mittel"}},
-            "Schritt": {"rich_text": [{"text": {"content": next_step[:1900]}}]},
-        }
-        if due_date and len(due_date) == 10 and due_date != "null":
-            props["Fällig"] = {"date": {"start": due_date}}
-        if inbox_page_id:
-            props["Notiz"] = {"relation": [{"id": inbox_page_id}]}
-
-        icon_emoji = "✅" if kind == "To-Do" else ("📅" if kind == "Erinnerung" else "💡")
-        payload: dict[str, Any] = {
-            "parent": {"database_id": tasks_db_id},
-            "icon": {"type": "emoji", "emoji": icon_emoji},
-            "properties": props,
-        }
-        res = self._request("POST", "/pages", payload)
-        return res["id"]
-
-    def query_open_tasks(self, tasks_db_id: str) -> list[dict[str, Any]]:
-        payload = {
-            "filter": {
-                "and": [
-                    {"property": "Status", "status": {"does_not_equal": "Erledigt"}},
-                    {"property": "Status", "status": {"does_not_equal": "Archiviert"}},
-                ]
-            }
-        }
-        res = self._request("POST", f"/databases/{tasks_db_id}/query", payload)
-        tasks_out: list[dict[str, Any]] = []
-        for page in res.get("results", []):
-            p = page.get("properties", {})
-            title_arr = p.get("Aufgabenbezeichnung", {}).get("title", [])
-            title = "".join(t.get("plain_text", "") for t in title_arr).strip()
-            if not title:
-                continue
-            status = (p.get("Status", {}).get("status") or {}).get("name", "Nicht begonnen")
-            kind = (p.get("Art", {}).get("select") or {}).get("name", "To-Do")
-            prio = (p.get("Prioritaet", {}).get("select") or {}).get("name", "Mittel")
-            due = (p.get("Fällig", {}).get("date") or {}).get("start")
-            step_arr = p.get("Schritt", {}).get("rich_text", [])
-            step = "".join(t.get("plain_text", "") for t in step_arr).strip()
-            tasks_out.append({
-                "notion_page_id": page["id"],
-                "kind": kind,
-                "title": title,
-                "priority": prio,
-                "due_date": due,
-                "next_step": step,
-                "status": status,
-            })
-        return tasks_out
-
-    def mark_task_done(self, page_id: str) -> None:
-        self._request("PATCH", f"/pages/{page_id}", {"properties": {"Status": {"status": {"name": "Erledigt"}}}})
-
-    def update_task(
-        self,
-        page_id: str,
-        due_date: str | None = None,
-        priority: str | None = None,
-        title: str | None = None,
-    ) -> None:
-        props: dict[str, Any] = {}
-        if due_date and len(due_date) == 10 and due_date != "null":
-            props["Fällig"] = {"date": {"start": due_date}}
-        if priority and priority in ("Hoch", "Mittel", "Niedrig"):
-            props["Prioritaet"] = {"select": {"name": priority}}
-        if title:
-            props["Aufgabenbezeichnung"] = {"title": [{"text": {"content": title[:100]}}]}
-        if props:
-            self._request("PATCH", f"/pages/{page_id}", {"properties": props})
-
-    def archive_task(self, page_id: str) -> None:
-        self._request("PATCH", f"/pages/{page_id}", {
-            "archived": True,
-            "properties": {"Status": {"status": {"name": "Archiviert"}}},
-        })
-
-    def search_workspace(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
-        payload = {
-            "query": query,
-            "page_size": limit,
-            "sort": {"direction": "descending", "timestamp": "last_edited_time"},
-        }
-        res = self._request("POST", "/search", payload)
-        out: list[dict[str, Any]] = []
-        for obj in res.get("results", []):
-            obj_type = obj.get("object", "page")
-            props = obj.get("properties", {})
-            title = ""
-            for pval in props.values():
-                if pval.get("type") == "title":
-                    title = "".join(t.get("plain_text", "") for t in pval.get("title", [])).strip()
-                    break
-            if not title:
-                title_arr = obj.get("title", [])
-                if isinstance(title_arr, list):
-                    title = "".join(t.get("plain_text", "") for t in title_arr).strip()
-            if not title:
-                title = obj.get("url", "Unbenannt")
-            out.append({
-                "id": obj.get("id"),
-                "type": obj_type,
-                "title": title,
-                "url": obj.get("url", ""),
-            })
-        return out
+GCAL_CACHE_PATH = calendar_sync.GCAL_CACHE_PATH
 
 
 def _normalize_hhmm(value: Any) -> str | None:
-    if not value or str(value).lower() == "null":
-        return None
-    s = str(value).strip()
-    if len(s) >= 5 and s[2] == ":":
-        return s[:5]
-    return None
+    return calendar_sync._normalize_hhmm(value)
 
 
 def export_ics_event(ev: dict[str, Any]) -> Path:
-    """Schreibt zusätzlich eine standardkonforme .ics-Kalenderdatei in calendar_outbox/."""
-    outbox = BASE_DIR / "calendar_outbox"
-    outbox.mkdir(parents=True, exist_ok=True)
-    title = ev.get("title") or "Termin"
-    date_str = ev.get("date") or dt.date.today().isoformat()
-    start_t = _normalize_hhmm(ev.get("start_time"))
-    end_t = _normalize_hhmm(ev.get("end_time"))
-    location = ev.get("location") or ""
-    description = ev.get("description") or ""
-
-    date_compact = date_str.replace("-", "")
-    if start_t:
-        st_compact = start_t.replace(":", "") + "00"
-        if end_t:
-            et_compact = end_t.replace(":", "") + "00"
-        else:
-            hour = (int(start_t[:2]) + 1) % 24
-            et_compact = f"{hour:02d}{start_t[3:5]}00"
-        dtstart_line = f"DTSTART:{date_compact}T{st_compact}"
-        dtend_line = f"DTEND:{date_compact}T{et_compact}"
-    else:
-        try:
-            next_day = (dt.date.fromisoformat(date_str) + dt.timedelta(days=1)).isoformat().replace("-", "")
-        except ValueError:
-            next_day = date_compact
-        dtstart_line = f"DTSTART;VALUE=DATE:{date_compact}"
-        dtend_line = f"DTEND;VALUE=DATE:{next_day}"
-
-    uid = f"{date_compact}-{abs(hash(title + date_str))}@notion-local-assistant"
-    ics_content = "\r\n".join([
-        "BEGIN:VCALENDAR",
-        "VERSION:2.0",
-        "PRODID:-//Stefan Kollmeier//Notion Local Assistant//DE",
-        "BEGIN:VEVENT",
-        f"UID:{uid}",
-        f"SUMMARY:{title}",
-        dtstart_line,
-        dtend_line,
-        f"LOCATION:{location}",
-        f"DESCRIPTION:{description}",
-        "END:VEVENT",
-        "END:VCALENDAR",
-        "",
-    ])
-    safe_name = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in title)[:40]
-    ics_path = outbox / f"{date_str}_{safe_name}.ics"
-    ics_path.write_text(ics_content, encoding="utf-8")
-    return ics_path
-
-
-GCAL_CACHE_PATH = BASE_DIR / "gcal_cache.json"
+    return calendar_sync.export_ics_event(ev)
 
 
 def get_gcalendar_bin() -> str | None:
-    """Findet die gcalendar CLI Executable bzw. Batch-Datei."""
-    bin_name = shutil.which("gcalendar") or shutil.which("gcalendar.cmd")
-    if bin_name:
-        return bin_name
-    wrapper = Path(os.environ.get("USERPROFILE", "")) / ".gemini/config/plugins/gcalendar/skills/gcalendar/scripts/gcalendar.cmd"
-    if wrapper.exists():
-        return str(wrapper)
-    return None
+    return calendar_sync.get_gcalendar_bin()
 
 
 def parse_ics_events(ics_text: str, start_date: dt.date, end_date: dt.date) -> list[dict[str, Any]]:
-    """Parst Termine aus iCal/ICS-Feeds inkl. Zeitzonenkonvertierung (Europe/Berlin) und Serienterminen (RRULE)."""
-    try:
-        from zoneinfo import ZoneInfo
-        tz_berlin = ZoneInfo("Europe/Berlin")
-    except Exception:
-        tz_berlin = None
-
-    events: list[dict[str, Any]] = []
-    # Zeilenfortsetzungen (RFC 5545 unfolding) auflösen
-    unfolded = re.sub(r"\r?\n[ \t]", "", ics_text)
-
-    def _parse_dt(val: str) -> tuple[dt.date | None, str | None, dt.datetime | None]:
-        val = val.strip()
-        if "T" not in val:
-            # Ganztägiger Termin (YYYYMMDD)
-            try:
-                d = dt.date(int(val[:4]), int(val[4:6]), int(val[6:8]))
-                return d, None, None
-            except Exception:
-                return None, None, None
-        is_utc = val.endswith("Z")
-        clean = val.rstrip("Z")
-        try:
-            d_part, t_part = clean.split("T", 1)
-            base = dt.datetime(
-                int(d_part[:4]), int(d_part[4:6]), int(d_part[6:8]),
-                int(t_part[:2]), int(t_part[2:4]),
-                int(t_part[4:6]) if len(t_part) >= 6 else 0,
-            )
-            if is_utc and tz_berlin:
-                base = base.replace(tzinfo=dt.timezone.utc).astimezone(tz_berlin)
-            return base.date(), base.strftime("%H:%M"), base
-        except Exception:
-            return None, None, None
-
-    in_event = False
-    cur: dict[str, str] = {}
-    exdates: set[dt.date] = set()
-
-    for raw_line in unfolded.splitlines():
-        line = raw_line.strip()
-        if line == "BEGIN:VEVENT":
-            in_event = True
-            cur = {}
-            exdates = set()
-        elif line == "END:VEVENT" and in_event:
-            in_event = False
-            if cur.get("STATUS", "").upper() == "CANCELLED":
-                continue
-
-            summary = cur.get("SUMMARY", "Termin").replace("\\,", ",").replace("\\;", ";").replace("\\n", " ")
-            loc = cur.get("LOCATION", "").replace("\\,", ",").replace("\\n", " ").strip()
-            uid = cur.get("UID", "")
-            raw_start = cur.get("DTSTART", "")
-            raw_end = cur.get("DTEND", "")
-
-            ev_date, st_time, _ = _parse_dt(raw_start)
-            if not ev_date:
-                continue
-            _, en_time, _ = _parse_dt(raw_end) if raw_end else (None, None, None)
-
-            rrule_raw = cur.get("RRULE", "")
-            if not rrule_raw:
-                # Einmaliger Termin
-                if start_date <= ev_date <= end_date and ev_date not in exdates:
-                    events.append({
-                        "id": uid,
-                        "title": summary,
-                        "date": ev_date.isoformat(),
-                        "start_time": st_time,
-                        "end_time": en_time,
-                        "location": loc,
-                        "link": "",
-                        "source": "Google Kalender (ICS)",
-                        "synced_to_gcal": True,
-                    })
-            else:
-                # Serientermin (RRULE) für den relevanten Zeitfenster-Ausschnitt expandieren
-                parts = dict(p.split("=", 1) for p in rrule_raw.split(";") if "=" in p)
-                freq = parts.get("FREQ", "").upper()
-                interval = max(int(parts.get("INTERVAL", 1) or 1), 1)
-                byday_raw = parts.get("BYDAY", "")
-                byday_list = [d.strip() for d in byday_raw.split(",") if d.strip()]
-                until_date = None
-                if "UNTIL" in parts:
-                    u_d, _, _ = _parse_dt(parts["UNTIL"])
-                    until_date = u_d
-                count = int(parts.get("COUNT", 0) or 0) or None
-
-                day_map = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
-                target_wd = [day_map[d] for d in byday_list if d in day_map] or [ev_date.weekday()]
-
-                if freq == "WEEKLY":
-                    check_d = ev_date
-                    seen_cnt = 0
-                    while check_d <= end_date:
-                        if until_date and check_d > until_date:
-                            break
-                        if count and seen_cnt >= count:
-                            break
-                        w_diff = (check_d - ev_date).days // 7
-                        if w_diff % interval == 0 and check_d.weekday() in target_wd:
-                            seen_cnt += 1
-                            if check_d >= start_date and check_d not in exdates:
-                                events.append({
-                                    "id": f"{uid}_{check_d.isoformat()}",
-                                    "title": summary,
-                                    "date": check_d.isoformat(),
-                                    "start_time": st_time,
-                                    "end_time": en_time,
-                                    "location": loc,
-                                    "link": "",
-                                    "source": "Google Kalender (ICS)",
-                                    "synced_to_gcal": True,
-                                })
-                        check_d += dt.timedelta(days=1)
-                elif freq == "DAILY":
-                    check_d = ev_date
-                    seen_cnt = 0
-                    while check_d <= end_date:
-                        if until_date and check_d > until_date:
-                            break
-                        if count and seen_cnt >= count:
-                            break
-                        d_diff = (check_d - ev_date).days
-                        if d_diff % interval == 0:
-                            seen_cnt += 1
-                            if check_d >= start_date and check_d not in exdates:
-                                events.append({
-                                    "id": f"{uid}_{check_d.isoformat()}",
-                                    "title": summary,
-                                    "date": check_d.isoformat(),
-                                    "start_time": st_time,
-                                    "end_time": en_time,
-                                    "location": loc,
-                                    "link": "",
-                                    "source": "Google Kalender (ICS)",
-                                    "synced_to_gcal": True,
-                                })
-                        check_d += dt.timedelta(days=1)
-                elif freq == "MONTHLY":
-                    for month_offset in range(0, 4):
-                        y = ev_date.year + (ev_date.month + month_offset - 1) // 12
-                        m = (ev_date.month + month_offset - 1) % 12 + 1
-                        try:
-                            check_d = dt.date(y, m, ev_date.day)
-                            if start_date <= check_d <= end_date and check_d not in exdates:
-                                events.append({
-                                    "id": f"{uid}_{check_d.isoformat()}",
-                                    "title": summary,
-                                    "date": check_d.isoformat(),
-                                    "start_time": st_time,
-                                    "end_time": en_time,
-                                    "location": loc,
-                                    "link": "",
-                                    "source": "Google Kalender (ICS)",
-                                    "synced_to_gcal": True,
-                                })
-                        except Exception:
-                            pass
-        elif in_event and ":" in line:
-            k_part, val = line.split(":", 1)
-            key = k_part.split(";", 1)[0].upper()
-            if key == "EXDATE":
-                for ex in val.split(","):
-                    ex_d, _, _ = _parse_dt(ex)
-                    if ex_d:
-                        exdates.add(ex_d)
-            else:
-                cur[key] = val.strip()
-
-    events.sort(key=lambda x: (x.get("date") or "", x.get("start_time") or "00:00"))
-    return events
+    return calendar_sync.parse_ics_events(ics_text, start_date, end_date)
 
 
 def create_google_calendar_event(ev: dict[str, Any]) -> str | None:
-    """
-    Erstellt einen Termin direkt im Google Kalender:
-    1. Über die `gcalendar` CLI (wenn verfügbar / in Antigravity).
-    2. Oder über ein Google Calendar OAuth Access Token (`GOOGLE_CALENDAR_ACCESS_TOKEN` in .env).
-    Gibt den Google-Calendar-Link zurück, falls erfolgreich, sonst None.
-    """
-    title = ev.get("title") or "Termin"
-    date_str = ev.get("date")
-    if not date_str or str(date_str).lower() == "null" or len(str(date_str)) != 10:
-        return None
-
-    start_t = _normalize_hhmm(ev.get("start_time"))
-    end_t = _normalize_hhmm(ev.get("end_time"))
-    location = (ev.get("location") or "").strip()
-    description = (ev.get("description") or "").strip()
-
-    # Lokaler Offset (Europe/Berlin)
-    local_offset = dt.datetime.now().astimezone().strftime("%z")
-    tz_offset = f"{local_offset[:3]}:{local_offset[3:]}" if len(local_offset) == 5 else "+01:00"
-
-    if start_t:
-        if not end_t:
-            end_hour = min(int(start_t[:2]) + 1, 23)
-            end_t = f"{end_hour:02d}:{start_t[3:5]}"
-        start_rfc = f"{date_str}T{start_t}:00{tz_offset}"
-        end_rfc = f"{date_str}T{end_t}:00{tz_offset}"
-        all_day = False
-    else:
-        try:
-            next_day = (dt.date.fromisoformat(date_str) + dt.timedelta(days=1)).isoformat()
-        except ValueError:
-            return None
-        start_rfc = date_str
-        end_rfc = next_day
-        all_day = True
-
-    # Weg 1: gcalendar CLI (falls im PATH)
-    gcal_bin = get_gcalendar_bin()
-    if gcal_bin:
-        cmd = [
-            gcal_bin,
-            "mutate",
-            "create",
-            "--summary",
-            title,
-            "--start",
-            start_rfc,
-            "--end",
-            end_rfc,
-            "--send-updates",
-            "none",
-        ]
-        if all_day:
-            cmd.append("--all-day")
-        if description:
-            cmd.extend(["--description", description])
-        if location:
-            cmd.extend(["--location", location])
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20, check=False)
-            if proc.returncode == 0:
-                for line in proc.stdout.splitlines():
-                    if "Link:" in line or "https://www.google.com/calendar" in line:
-                        return line.split("Link:", 1)[-1].strip()
-                return "created-via-gcalendar"
-        except Exception:
-            pass
-
-    # Weg 2: Direkter Google Calendar REST API Aufruf (falls GOOGLE_CALENDAR_ACCESS_TOKEN gesetzt ist)
-    gcal_token = os.environ.get("GOOGLE_CALENDAR_ACCESS_TOKEN", "").strip()
-    if gcal_token:
-        cal_id = os.environ.get("GOOGLE_CALENDAR_ID", "primary").strip()
-        body: dict[str, Any] = {
-            "summary": title,
-            "description": description,
-            "location": location,
-            "start": {"date": start_rfc} if all_day else {"dateTime": start_rfc},
-            "end": {"date": end_rfc} if all_day else {"dateTime": end_rfc},
-        }
-        req = request.Request(
-            f"https://www.googleapis.com/calendar/v3/calendars/{cal_id}/events?sendUpdates=none",
-            data=json.dumps(body).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {gcal_token}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            with request.urlopen(req, timeout=20) as resp:
-                res = json.loads(resp.read().decode("utf-8"))
-                return res.get("htmlLink") or "created-via-rest"
-        except Exception as exc:
-            print(f"[Google Calendar API] Hinweis: {exc}")
-
-    return None
+    return calendar_sync.create_google_calendar_event(ev)
 
 
 def handle_extracted_calendar_events(
@@ -1052,14 +565,12 @@ def handle_extracted_calendar_events(
         loc = ev.get("location") or ""
         step_text = f"Termin am {date_str}{time_info}" + (f" | Ort: {loc}" if loc else "") + (f" | {desc}" if desc else "")
 
-        # 1. Im Google Kalender eintragen + .ics Datei erzeugen
         ics_path = export_ics_event(ev)
         gcal_link = create_google_calendar_event(ev)
         if gcal_link:
             print(f"[Google Kalender] Termin eingetragen: '{title}' am {date_str}{time_info} -> {gcal_link}")
         else:
             print(f"[Kalender] Termin vorgemerkt & .ics erstellt ({ics_path.name}): '{title}' am {date_str}{time_info}")
-            # Nur falls der Google Kalender gerade nicht direkt erreichbar war, als Erinnerung in Notion sichern
             if notion:
                 notion.create_task_page(
                     tasks_db_id=tasks_db_id,
@@ -1069,6 +580,7 @@ def handle_extracted_calendar_events(
                     due_date=date_str,
                     next_step=step_text,
                     inbox_page_id=inbox_page_id,
+                    area=agent_tools.detect_area(f"{title} {desc}"),
                 )
 
         rec = {
@@ -1081,6 +593,7 @@ def handle_extracted_calendar_events(
             "source_title": source_title,
             "ics_file": str(ics_path.relative_to(BASE_DIR)),
             "gcal_link": gcal_link,
+            "gcal_event_id": ev.get("gcal_event_id"),
             "synced_to_gcal": bool(gcal_link),
         }
         state["calendar_events"].append(rec)
@@ -1102,139 +615,15 @@ def sync_pending_calendar_events(state: dict[str, Any]) -> int:
         if link:
             ev["gcal_link"] = link
             ev["synced_to_gcal"] = True
+            if ev.get("gcal_event_id"):
+                ev["gcal_event_id"] = ev["gcal_event_id"]
             count += 1
             print(f"[Google Kalender] Nachträglich synchronisiert: '{ev.get('title')}' ({ev.get('date')}) -> {link}")
     return count
 
 
 def fetch_google_calendar_events(days_ahead: int = 14) -> list[dict[str, Any]]:
-    """
-    Holt die tatsächlichen Termine aus dem verbundenen Google Kalender:
-    1. Über die `gcalendar` CLI (speichert Ergebnisse zudem automatisch in `gcal_cache.json`).
-    2. Über eine geheime iCal-URL (`GOOGLE_CALENDAR_ICS_URL` in .env oder `config.json`), falls gesetzt.
-    3. Fallback auf den lokalen Kalender-Cache (`gcal_cache.json`), falls der Hintergrund-Task
-       temporär keinen OAuth-Token hat.
-    """
-    events_out: list[dict[str, Any]] = []
-    today = dt.date.today()
-    end_date = today + dt.timedelta(days=days_ahead)
-    start_iso = f"{today.isoformat()}T00:00:00Z"
-    end_iso = f"{end_date.isoformat()}T23:59:59Z"
-
-    # 1. Versuch: gcalendar CLI
-    gcal_bin = get_gcalendar_bin()
-    if gcal_bin:
-        # Wir rufen immer 30 Tage ab, damit der Cache für den Hintergrundbetrieb reichhaltig gefüllt bleibt
-        cache_end_iso = f"{(today + dt.timedelta(days=max(days_ahead, 30))).isoformat()}T23:59:59Z"
-        cmd = [gcal_bin, "readonly", "events", "--start", start_iso, "--end", cache_end_iso, "--max", "100", "--json"]
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15, check=False)
-            if proc.returncode == 0 and proc.stdout.strip():
-                raw_events = json.loads(proc.stdout)
-                all_fetched: list[dict[str, Any]] = []
-                for ev in raw_events:
-                    summary = ev.get("summary") or "Termin"
-                    start_obj = ev.get("start", {})
-                    start_dt = start_obj.get("dateTime") or start_obj.get("date") or ""
-                    end_obj = ev.get("end", {})
-                    end_dt = end_obj.get("dateTime") or end_obj.get("date") or ""
-
-                    date_part = start_dt[:10] if len(start_dt) >= 10 else ""
-                    start_time = start_dt[11:16] if "T" in start_dt else None
-                    end_time = end_dt[11:16] if "T" in end_dt else None
-                    loc = (ev.get("location") or "").strip()
-                    item = {
-                        "id": ev.get("id"),
-                        "title": summary,
-                        "date": date_part,
-                        "start_time": start_time,
-                        "end_time": end_time,
-                        "location": loc,
-                        "link": ev.get("htmlLink", ""),
-                        "source": "Google Kalender",
-                        "synced_to_gcal": True,
-                    }
-                    all_fetched.append(item)
-                    if today.isoformat() <= date_part <= end_date.isoformat():
-                        events_out.append(item)
-
-                # Cache aktualisieren für Hintergrundläufe
-                try:
-                    GCAL_CACHE_PATH.write_text(
-                        json.dumps(
-                            {
-                                "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
-                                "events": all_fetched,
-                            },
-                            ensure_ascii=False,
-                            indent=2,
-                        ),
-                        encoding="utf-8",
-                    )
-                except Exception:
-                    pass
-                events_out.sort(key=lambda x: (x.get("date") or "", x.get("start_time") or "00:00"))
-                return events_out
-        except Exception as exc:
-            print(f"[Google Kalender CLI Hinweis] {exc}")
-
-    # 2. Versuch: Google Calendar Secret iCal URL (falls konfiguriert)
-    ics_urls_raw = os.environ.get("GOOGLE_CALENDAR_ICS_URL", "").strip()
-    if ics_urls_raw:
-        for single_url in re.split(r"[\r\n,;]+", ics_urls_raw):
-            single_url = single_url.strip()
-            if not single_url or not single_url.startswith(("http://", "https://")):
-                continue
-            try:
-                req = request.Request(single_url, headers={"User-Agent": "NotionLocalAssistant/1.0"})
-                with request.urlopen(req, timeout=15) as resp:
-                    ics_text = resp.read().decode("utf-8", errors="replace")
-                parsed = parse_ics_events(ics_text, today, end_date)
-                events_out.extend(parsed)
-            except Exception as exc:
-                print(f"[Google Kalender ICS Hinweis] Fehler beim Abrufen ({single_url[:40]}...): {exc}")
-
-        if events_out:
-            # Deduplizieren
-            seen = set()
-            deduped = []
-            for ev in events_out:
-                k = (ev.get("title"), ev.get("date"), ev.get("start_time"))
-                if k not in seen:
-                    seen.add(k)
-                    deduped.append(ev)
-            events_out = deduped
-            # Im Cache sichern für Offline- & Daemon-Betrieb
-            try:
-                GCAL_CACHE_PATH.write_text(
-                    json.dumps(
-                        {
-                            "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
-                            "events": events_out,
-                        },
-                        ensure_ascii=False,
-                        indent=2,
-                    ),
-                    encoding="utf-8",
-                )
-            except Exception:
-                pass
-            events_out.sort(key=lambda x: (x.get("date") or "", x.get("start_time") or "00:00"))
-            return events_out
-
-    # 3. Fallback: Lokaler Kalender-Cache (gcal_cache.json)
-    if GCAL_CACHE_PATH.exists():
-        try:
-            cache_data = json.loads(GCAL_CACHE_PATH.read_text(encoding="utf-8"))
-            for ev in cache_data.get("events", []):
-                d_part = ev.get("date") or ""
-                if today.isoformat() <= d_part <= end_date.isoformat():
-                    events_out.append(ev)
-        except Exception:
-            pass
-
-    events_out.sort(key=lambda x: (x.get("date") or "", x.get("start_time") or "00:00"))
-    return events_out
+    return calendar_sync.fetch_google_calendar_events(days_ahead=days_ahead)
 
 
 def find_matching_google_calendar_event(
@@ -1242,41 +631,7 @@ def find_matching_google_calendar_event(
     query_date: str | None = None,
     days_ahead: int = 30,
 ) -> dict[str, Any] | None:
-    """Sucht einen Termin im Google Kalender nach Titel und optional Datum."""
-    events = fetch_google_calendar_events(days_ahead=days_ahead)
-    if not events:
-        return None
-
-    clean_q = (query_title or "").strip().lower()
-    if not clean_q:
-        return None
-
-    # 1. Datum & exakter/Teil-Titel
-    date_filtered = [ev for ev in events if ev.get("date") == query_date] if query_date else events
-    for ev in date_filtered:
-        t = (ev.get("title") or "").strip().lower()
-        if clean_q in t or t in clean_q:
-            return ev
-
-    # 2. Ohne Datumsteilsuche, falls 1 keinen Treffer ergab
-    if query_date and date_filtered != events:
-        for ev in events:
-            t = (ev.get("title") or "").strip().lower()
-            if clean_q in t or t in clean_q:
-                return ev
-
-    # 3. Wort-Überlappung (z. B. "Elterngespräch" vs "Elterngespräch Jasper")
-    q_words = {w for w in clean_q.replace("-", " ").split() if len(w) >= 3}
-    best_ev = None
-    best_overlap = 0
-    for ev in events:
-        ev_words = {w for w in (ev.get("title") or "").lower().replace("-", " ").split() if len(w) >= 3}
-        overlap = len(q_words & ev_words)
-        if overlap > best_overlap:
-            best_overlap = overlap
-            best_ev = ev
-
-    return best_ev
+    return calendar_sync.find_matching_google_calendar_event(query_title, query_date=query_date, days_ahead=days_ahead)
 
 
 def update_google_calendar_event(
@@ -1286,58 +641,18 @@ def update_google_calendar_event(
     new_end_time: str | None = None,
     new_title: str | None = None,
 ) -> bool:
-    """Aktualisiert einen bestehenden Google-Kalendertermin über gcalendar mutate update."""
-    gcal_bin = get_gcalendar_bin()
-    if not gcal_bin or not event_id:
-        return False
-
-    cmd = [gcal_bin, "mutate", "update", event_id]
-
-    local_offset = dt.datetime.now().astimezone().strftime("%z")
-    tz_offset = f"{local_offset[:3]}:{local_offset[3:]}" if len(local_offset) == 5 else "+01:00"
-
-    if new_date and new_start_time:
-        start_t = _normalize_hhmm(new_start_time)
-        end_t = _normalize_hhmm(new_end_time)
-        if not end_t and start_t:
-            end_hour = min(int(start_t[:2]) + 1, 23)
-            end_t = f"{end_hour:02d}:{start_t[3:5]}"
-        start_rfc = f"{new_date}T{start_t}:00{tz_offset}"
-        end_rfc = f"{new_date}T{end_t}:00{tz_offset}"
-        cmd.extend(["--start", start_rfc, "--end", end_rfc])
-    elif new_date and not new_start_time:
-        try:
-            next_day = (dt.date.fromisoformat(new_date) + dt.timedelta(days=1)).isoformat()
-        except ValueError:
-            next_day = new_date
-        cmd.extend(["--start", f"{new_date}T00:00:00{tz_offset}", "--end", f"{next_day}T00:00:00{tz_offset}"])
-
-    if new_title:
-        cmd.extend(["--summary", new_title])
-
-    cmd.extend(["--send-updates", "none"])
-
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20, check=False)
-        return proc.returncode == 0
-    except Exception as exc:
-        print(f"[Google Kalender Update Fehler] {exc}")
-        return False
+    return calendar_sync.update_google_calendar_event(
+        event_id=event_id,
+        new_date=new_date,
+        new_start_time=new_start_time,
+        new_end_time=new_end_time,
+        new_title=new_title,
+    )
 
 
 def delete_google_calendar_event(event_id: str) -> bool:
-    """Löscht einen Google-Kalendertermin über gcalendar mutate delete."""
-    gcal_bin = get_gcalendar_bin()
-    if not gcal_bin or not event_id:
-        return False
+    return calendar_sync.delete_google_calendar_event(event_id)
 
-    cmd = [gcal_bin, "mutate", "delete", event_id, "--send-updates", "none"]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20, check=False)
-        return proc.returncode == 0
-    except Exception as exc:
-        print(f"[Google Kalender Delete Fehler] {exc}")
-        return False
 
 
 def format_suggestions_text(suggestions: list[dict[str, Any]]) -> str:
@@ -1534,6 +849,7 @@ def process_emails(
         suggestions_str = format_suggestions_text(analysis["suggestions"])
 
         inbox_page_id: str | None = None
+        note_area = analysis.get("area") or agent_tools.detect_area(raw_text)
         if notion:
             inbox_page_id = notion.create_inbox_page(
                 inbox_db_id=cfg["notion"]["inbox_database_id"],
@@ -1542,6 +858,7 @@ def process_emails(
                 raw_text=raw_text,
                 summary=analysis["summary"],
                 suggestions_text=suggestions_str,
+                area=note_area,
             )
             for todo in analysis["todos"]:
                 notion.create_task_page(
@@ -1552,6 +869,8 @@ def process_emails(
                     due_date=todo.get("due_date"),
                     next_step=todo.get("next_step", ""),
                     inbox_page_id=inbox_page_id,
+                    area=todo.get("area") or note_area,
+                    estimated_minutes=todo.get("estimated_minutes"),
                 )
 
         state["items"].append({
@@ -1572,6 +891,8 @@ def process_emails(
                 "next_step": todo.get("next_step", ""),
                 "source_title": f"Mail: {analysis['title']}",
                 "status": "Nicht begonnen",
+                "area": todo.get("area") or note_area,
+                "estimated_minutes": int(todo.get("estimated_minutes") or 30),
             })
 
         handle_extracted_calendar_events(
@@ -1626,6 +947,7 @@ def process_local_drop_folder(
         suggestions_str = format_suggestions_text(analysis["suggestions"])
 
         inbox_page_id: str | None = None
+        note_area = analysis.get("area") or agent_tools.detect_area(raw_text)
         if notion:
             inbox_page_id = notion.create_inbox_page(
                 inbox_db_id=cfg["notion"]["inbox_database_id"],
@@ -1634,6 +956,7 @@ def process_local_drop_folder(
                 raw_text=raw_text,
                 summary=analysis["summary"],
                 suggestions_text=suggestions_str,
+                area=note_area,
             )
             for todo in analysis["todos"]:
                 notion.create_task_page(
@@ -1644,6 +967,8 @@ def process_local_drop_folder(
                     due_date=todo.get("due_date"),
                     next_step=todo.get("next_step", ""),
                     inbox_page_id=inbox_page_id,
+                    area=todo.get("area") or note_area,
+                    estimated_minutes=todo.get("estimated_minutes"),
                 )
             # Hinweis: KI-Vorschläge werden NICHT als Tasks angelegt, um die Aufgabenliste nicht zu überladen.
 
@@ -1666,6 +991,8 @@ def process_local_drop_folder(
                 "next_step": todo.get("next_step", ""),
                 "source_title": analysis["title"],
                 "status": "Nicht begonnen",
+                "area": todo.get("area") or note_area,
+                "estimated_minutes": int(todo.get("estimated_minutes") or 30),
             })
 
         handle_extracted_calendar_events(
@@ -1986,6 +1313,428 @@ Gib ein JSON-Objekt zurück mit genau dieser Struktur:
         return {"intent": "NOTE_OR_TASK"}
 
 
+def _execute_undo(
+    store: StateStore,
+    chat_id: str,
+    state: dict[str, Any],
+    notion: NotionClient | None,
+) -> str:
+    """Macht die letzte protokollierte Aktion (Task erledigen/anlegen, Termin löschen/anlegen) rückgängig."""
+    entry = store.pop_last_undo("main", chat_id)
+    if not entry:
+        return "ℹ️ Keine kürzliche Aktion zum Rückgängigmachen vorhanden."
+
+    action = entry.get("action_type", "")
+    payload = entry.get("payload") or {}
+
+    if action == "reopen_tasks":
+        titles = payload.get("titles") or []
+        page_ids = payload.get("page_ids") or []
+        for pid in page_ids:
+            if notion and pid:
+                try:
+                    notion.reopen_task(pid)
+                except Exception as exc:
+                    log.warning("Undo reopen_task Fehler (%s): %s", pid, exc)
+        for t in state.get("tasks", []):
+            if t.get("notion_page_id") in page_ids or t.get("title") in titles:
+                t["status"] = "Nicht begonnen"
+        label = ", ".join(telegram_ui.esc(x) for x in titles[:3]) or f"{len(page_ids)} Aufgabe(n)"
+        return f"↩️ <b>Wieder geöffnet:</b> {label}"
+
+    if action == "archive_task":
+        pid = payload.get("page_id")
+        title = payload.get("title") or "Aufgabe"
+        if notion and pid:
+            try:
+                notion.archive_task(pid)
+            except Exception as exc:
+                log.warning("Undo archive_task Fehler (%s): %s", pid, exc)
+        state["tasks"] = [
+            t for t in state.get("tasks", [])
+            if t.get("notion_page_id") != pid and t.get("title") != title
+        ]
+        return f"↩️ <b>Aufgabe wieder entfernt:</b> {telegram_ui.esc(title)}"
+
+    if action == "reopen_task":
+        pid = payload.get("page_id")
+        title = payload.get("title") or "Aufgabe"
+        if notion and pid:
+            try:
+                notion.reopen_task(pid)
+            except Exception as exc:
+                log.warning("Undo reopen_task Fehler (%s): %s", pid, exc)
+        return f"↩️ <b>Gelöschte Aufgabe wiederhergestellt:</b> {telegram_ui.esc(title)}"
+
+    if action == "delete_event":
+        eid = payload.get("event_id")
+        title = payload.get("title") or "Termin"
+        ok = bool(eid and delete_google_calendar_event(eid))
+        state["calendar_events"] = [
+            e for e in state.get("calendar_events", [])
+            if e.get("gcal_event_id") != eid and e.get("title") != title
+        ]
+        if ok or not eid:
+            return f"↩️ <b>Termin wieder entfernt:</b> {telegram_ui.esc(title)}"
+        return f"⚠️ Konnte Termin '{telegram_ui.esc(title)}' in Google Kalender nicht entfernen."
+
+    if action == "restore_event":
+        ev = dict(payload)
+        link = create_google_calendar_event(ev)
+        if link:
+            state.setdefault("calendar_events", []).append({
+                "title": ev.get("title", "Termin"),
+                "date": ev.get("date"),
+                "start_time": ev.get("start_time"),
+                "end_time": ev.get("end_time"),
+                "location": ev.get("location", ""),
+                "description": ev.get("description", ""),
+                "gcal_link": link,
+                "gcal_event_id": ev.get("gcal_event_id"),
+                "synced_to_gcal": True,
+            })
+            return f"↩️ <b>Termin wiederhergestellt:</b> {telegram_ui.esc(ev.get('title', 'Termin'))}"
+        return f"⚠️ Konnte Termin '{telegram_ui.esc(ev.get('title', 'Termin'))}' nicht wiederherstellen."
+
+    return "ℹ️ Aktionstyp kann nicht rückgängig gemacht werden."
+
+
+def _build_slots_reply(
+    target_date: dt.date,
+    cfg: dict[str, Any],
+    state: dict[str, Any],
+    store: StateStore,
+) -> tuple[str, dict[str, Any] | None]:
+    """Erstellt die /slots Übersicht (inkl. anonymer Arbeitskalender-Blocker + Time-Block Buttons)."""
+    import uuid
+
+    date_iso = target_date.isoformat()
+    today_iso = dt.date.today().isoformat()
+    days_delta = max(1, (target_date - dt.date.today()).days + 1)
+
+    gcal_events = fetch_google_calendar_events(days_ahead=days_delta)
+    work_busy = calendar_sync.fetch_work_busy_slots(days_ahead=days_delta, store=store)
+
+    seen_keys = {(ev.get("title"), ev.get("date"), ev.get("start_time")) for ev in gcal_events}
+    private_events = [ev for ev in gcal_events if ev.get("date") == date_iso]
+    for ev in state.get("calendar_events", []):
+        if ev.get("date") != date_iso or (ev.get("date") or "") < today_iso:
+            continue
+        key = (ev.get("title"), ev.get("date"), ev.get("start_time"))
+        if key not in seen_keys:
+            private_events.append(ev)
+            seen_keys.add(key)
+    private_events.sort(key=lambda x: x.get("start_time") or "00:00")
+
+    day_work_busy = [w for w in work_busy if w.get("date") == date_iso]
+
+    work_hours = cfg.get("work_hours", {})
+    work_start = os.environ.get("WORK_HOURS_START") or work_hours.get("start", "08:00")
+    work_end = os.environ.get("WORK_HOURS_END") or work_hours.get("end", "20:00")
+
+    combined = private_events + day_work_busy
+    free_slots = calendar_sync.compute_free_slots(
+        combined,
+        target_date=date_iso,
+        work_start=work_start,
+        work_end=work_end,
+        min_slot_minutes=30,
+    )
+    open_todos = [t for t in state.get("tasks", []) if t.get("kind") == "To-Do" and t.get("status") != "Erledigt"]
+    block_suggestions = calendar_sync.suggest_time_blocks(free_slots, open_todos, max_suggestions=3)
+
+    weekday_names = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
+    wd = weekday_names[target_date.weekday()]
+    lines = [f"⏱️ <b>Zeitfenster & Fokus-Slots ({wd}, {date_iso})</b>\n"]
+
+    if private_events:
+        lines.append("📅 <b>Private Termine:</b>")
+        for ev in private_events:
+            t_lbl = (
+                f"{ev['start_time']}–{ev.get('end_time') or ''}"
+                if ev.get("start_time")
+                else "Ganztägig"
+            )
+            lines.append(f"  • {telegram_ui.esc(t_lbl)} · {telegram_ui.esc(ev.get('title', 'Termin'))}")
+        lines.append("")
+
+    if day_work_busy:
+        lines.append(f"🔒 <b>Arbeitskalender (nur Frei/Belegt, {len(day_work_busy)} Blöcke):</b>")
+        for wb in day_work_busy:
+            w_lbl = (
+                f"{wb['start_time']}–{wb.get('end_time') or ''}"
+                if wb.get("start_time")
+                else "Ganztägig"
+            )
+            lines.append(f"  • {telegram_ui.esc(w_lbl)} · Arbeit: Belegt")
+        lines.append("")
+
+    if free_slots:
+        lines.append("⏳ <b>Freie Zeitfenster:</b>")
+        for sl in free_slots:
+            lines.append(
+                f"  • <b>{sl['start_time']}–{sl['end_time']}</b> ({sl['duration_minutes']} Min.)"
+            )
+    else:
+        lines.append("⏳ <b>Freie Zeitfenster:</b> Keine freien Blöcke ≥ 30 Min. gefunden.")
+
+    kb_rows: list[list[tuple[str, str]]] = []
+    if block_suggestions:
+        lines.append("\n🎯 <b>Vorgeschlagene Time-Blocks (Top-To-Dos):</b>")
+        for sug in block_suggestions:
+            lines.append(
+                f"  • {sug['start_time']}–{sug['end_time']}: "
+                f"<b>{telegram_ui.esc(sug['task_title'])}</b> [{telegram_ui.esc(sug['priority'])}]"
+            )
+            tok = uuid.uuid4().hex[:10]
+            store.put_callback_payload(tok, "time_block", sug)
+            lbl = f"⏱️ Blocken: {sug['task_title'][:22]} ({sug['start_time']})"
+            kb_rows.append([(lbl, f"block:{tok}")])
+
+    markup = telegram_ui.build_inline_keyboard(kb_rows) if kb_rows else None
+    return "\n".join(lines), markup
+
+
+def _handle_telegram_callback_query(
+    cq: dict[str, Any],
+    bot_token: str,
+    api_base: str,
+    cfg: dict[str, Any],
+    state: dict[str, Any],
+    state_path: Path,
+    notion: NotionClient | None,
+    store: StateStore,
+) -> bool:
+    """Verarbeitet Inline-Button-Klicks (`done:`, `defer:`, `block:`, `undo:`)."""
+    cq_id = cq.get("id", "")
+    data = str(cq.get("data") or "")
+    msg = cq.get("message") or {}
+    chat_id = str((msg.get("chat") or {}).get("id") or (cq.get("from") or {}).get("id") or "")
+
+    if not telegram_ui.is_authorized_chat(chat_id, env_keys=("TELEGRAM_CHAT_ID", "TELEGRAM_ALLOWED_USERS")):
+        telegram_ui.answer_callback_query(bot_token, cq_id, "Keine Berechtigung.", show_alert=True)
+        return False
+
+    open_todos = [t for t in state.get("tasks", []) if t.get("kind") == "To-Do" and t.get("status") != "Erledigt"]
+
+    if data.startswith("done:"):
+        try:
+            idx = int(data.split(":", 1)[1])
+        except ValueError:
+            idx = 0
+        if 1 <= idx <= len(open_todos):
+            t = open_todos[idx - 1]
+            t["status"] = "Erledigt"
+            n_id = t.get("notion_page_id")
+            if notion and n_id:
+                try:
+                    notion.mark_task_done(n_id)
+                except Exception as exc:
+                    log.warning("Callback mark_task_done Fehler: %s", exc)
+            store.push_undo(
+                "main",
+                chat_id,
+                "reopen_tasks",
+                {"page_ids": [n_id] if n_id else [], "titles": [t.get("title", "")]},
+            )
+            save_local_state(state_path, state)
+            telegram_ui.answer_callback_query(bot_token, cq_id, "✅ Als erledigt markiert!")
+            markup = telegram_ui.build_inline_keyboard([[("↩️ Rückgängig", "undo:last")]])
+            _send_telegram_message(
+                api_base,
+                chat_id,
+                f"✅ <b>Erledigt:</b> {telegram_ui.esc(t.get('title', 'Aufgabe'))}",
+                reply_markup=markup,
+            )
+            return True
+        telegram_ui.answer_callback_query(bot_token, cq_id, "Aufgabe nicht mehr in offener Liste.")
+        return False
+
+    if data.startswith("defer:"):
+        try:
+            idx = int(data.split(":", 1)[1])
+        except ValueError:
+            idx = 0
+        if 1 <= idx <= len(open_todos):
+            t = open_todos[idx - 1]
+            tomorrow = (dt.date.today() + dt.timedelta(days=1)).isoformat()
+            t["due_date"] = tomorrow
+            n_id = t.get("notion_page_id")
+            if notion and n_id:
+                try:
+                    notion.update_task(page_id=n_id, due_date=tomorrow)
+                except Exception as exc:
+                    log.warning("Callback defer update_task Fehler: %s", exc)
+            defers = store.increment_task_defer(n_id or t.get("title", ""))
+            save_local_state(state_path, state)
+            telegram_ui.answer_callback_query(bot_token, cq_id, f"📅 Auf {tomorrow} verschoben")
+            hint = (
+                f"\n💡 <i>Hinweis: Schon {defers}× verschoben – evtl. in kleineren 15-Min-Schritt teilen oder streichen?</i>"
+                if defers >= 3
+                else ""
+            )
+            _send_telegram_message(
+                api_base,
+                chat_id,
+                f"📅 <b>Auf morgen ({tomorrow}) verschoben:</b> {telegram_ui.esc(t.get('title', 'Aufgabe'))}{hint}",
+            )
+            return True
+        telegram_ui.answer_callback_query(bot_token, cq_id, "Aufgabe nicht gefunden.")
+        return False
+
+    if data.startswith("block:"):
+        tok = data.split(":", 1)[1]
+        entry = store.get_callback_payload(tok)
+        if not entry:
+            telegram_ui.answer_callback_query(bot_token, cq_id, "Slot-Vorschlag abgelaufen.")
+            return False
+        _, payload = entry
+        ev_dict = {
+            "title": f"Fokus: {payload.get('task_title', 'Aufgabe')}",
+            "date": payload.get("date"),
+            "start_time": payload.get("start_time"),
+            "end_time": payload.get("end_time"),
+            "location": "",
+            "description": "Smart Time-Block via Telegram",
+        }
+        created = handle_extracted_calendar_events(
+            events=[ev_dict],
+            source_title="Time-Block",
+            state=state,
+            notion=notion,
+            tasks_db_id=cfg["notion"]["tasks_database_id"],
+        )
+        if created and created[0].get("gcal_event_id"):
+            store.push_undo(
+                "main",
+                chat_id,
+                "delete_event",
+                {"event_id": created[0]["gcal_event_id"], "title": created[0]["title"]},
+            )
+        save_local_state(state_path, state)
+        telegram_ui.answer_callback_query(bot_token, cq_id, "⏱️ Zeitblock eingetragen!")
+        markup = telegram_ui.build_inline_keyboard([[("↩️ Rückgängig", "undo:last")]])
+        _send_telegram_message(
+            api_base,
+            chat_id,
+            f"⏱️ <b>Fokus-Slot im Kalender geblockt:</b>\n"
+            f"• {telegram_ui.esc(ev_dict['title'])}\n"
+            f"• {ev_dict['date']} {ev_dict['start_time']}–{ev_dict['end_time']} Uhr",
+            reply_markup=markup,
+        )
+        return True
+
+    if data == "undo:last":
+        res_msg = _execute_undo(store, chat_id, state, notion)
+        save_local_state(state_path, state)
+        telegram_ui.answer_callback_query(bot_token, cq_id, "Rückgängig ausgeführt")
+        _send_telegram_message(api_base, chat_id, res_msg)
+        return True
+
+    telegram_ui.answer_callback_query(bot_token, cq_id, "Unbekannte Aktion.")
+    return False
+
+
+def _persist_analysis_and_reply(
+    api_base: str,
+    chat_id: str,
+    source: str,
+    update_id: int,
+    raw_text: str,
+    analysis: dict[str, Any],
+    cfg: dict[str, Any],
+    state: dict[str, Any],
+    notion: NotionClient | None,
+) -> None:
+    """Speichert eine ausgewertete Notiz (Text, Voice oder Foto/PDF) in Notion & lokalem Zustand und sendet HTML-Antwort."""
+    suggestions_str = format_suggestions_text(analysis.get("suggestions") or [])
+    note_area = analysis.get("area") or agent_tools.detect_area(raw_text)
+
+    inbox_page_id: str | None = None
+    if notion:
+        inbox_page_id = notion.create_inbox_page(
+            inbox_db_id=cfg["notion"]["inbox_database_id"],
+            title=analysis["title"],
+            source=source,
+            raw_text=raw_text,
+            summary=analysis["summary"],
+            suggestions_text=suggestions_str,
+            area=note_area,
+        )
+        for todo in analysis.get("todos") or []:
+            notion.create_task_page(
+                tasks_db_id=cfg["notion"]["tasks_database_id"],
+                title=todo.get("title", "Aufgabe"),
+                kind="To-Do",
+                priority=todo.get("priority", "Mittel"),
+                due_date=todo.get("due_date"),
+                next_step=todo.get("next_step", ""),
+                inbox_page_id=inbox_page_id,
+                area=todo.get("area") or note_area,
+                estimated_minutes=todo.get("estimated_minutes"),
+            )
+
+    record = {
+        "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+        "file": f"telegram_{update_id}",
+        "source": source,
+        "raw_text": raw_text,
+        "analysis": analysis,
+        "notion_inbox_page_id": inbox_page_id,
+        "synced_to_notion": bool(inbox_page_id),
+    }
+    state["items"].append(record)
+    for todo in analysis.get("todos") or []:
+        state["tasks"].append({
+            "kind": "To-Do",
+            "title": todo.get("title", ""),
+            "priority": todo.get("priority", "Mittel"),
+            "due_date": todo.get("due_date"),
+            "next_step": todo.get("next_step", ""),
+            "source_title": analysis["title"],
+            "status": "Nicht begonnen",
+            "area": todo.get("area") or note_area,
+            "estimated_minutes": int(todo.get("estimated_minutes") or 30),
+        })
+
+    created_cal = handle_extracted_calendar_events(
+        events=analysis.get("calendar_events", []),
+        source_title=analysis["title"],
+        state=state,
+        notion=notion,
+        tasks_db_id=cfg["notion"]["tasks_database_id"],
+        inbox_page_id=inbox_page_id,
+    )
+
+    todo_lines = (
+        "\n".join(
+            f"• {telegram_ui.esc(t.get('title'))} ({telegram_ui.esc(t.get('priority', 'Mittel'))})"
+            for t in (analysis.get("todos") or [])
+        )
+        or "Keine direkten To-Dos"
+    )
+    cal_lines = (
+        "\n".join(
+            f"• {telegram_ui.esc(c.get('title'))} ({c.get('date')} {c.get('start_time') or 'Ganztägig'})"
+            for c in created_cal
+        )
+        or "Keine Termine"
+    )
+    sug_lines = (
+        "\n".join(f"• {telegram_ui.esc(s.get('title'))}" for s in (analysis.get("suggestions") or []))
+        or "Keine"
+    )
+    reply = (
+        f"✅ <b>Ausgewertet:</b> {telegram_ui.esc(analysis['title'])} "
+        f"<i>[{telegram_ui.esc(note_area)}]</i>\n\n"
+        f"📝 {telegram_ui.esc(analysis['summary'])}\n\n"
+        f"📌 <b>To-Dos:</b>\n{todo_lines}\n\n"
+        f"📅 <b>Kalendereinträge:</b>\n{cal_lines}\n\n"
+        f"💡 <b>Vorschläge:</b>\n{sug_lines}"
+    )
+    _send_telegram_message(api_base, chat_id, reply)
+
+
 def process_telegram_updates(
     cfg: dict[str, Any],
     state: dict[str, Any],
@@ -1995,18 +1744,17 @@ def process_telegram_updates(
 ) -> int:
     """
     Bidirektionale Telegram-Steuerung (2 Richtungen):
-    - Nimmt neue Sprach- und Textnotizen auf -> Whisper + Ollama -> Notion & Google Kalender
-    - Beantwortet Fragen an den Assistenten (per Sprache oder Text)
-    - Unterstützt Schnellbefehle: /briefing, /morgen, /abend, /todos, /ideen, /erledigt <Nr>
+    - Inline-Buttons (`callback_query`: erledigen, auf morgen, Slot blocken, Undo)
+    - Sprachnotizen, Fotos (Terminzettel/Rechnungen) & Dokumente (PDF/TXT/MD)
+    - Gemini Multi-Tool Function Calling mit StepBudget & Multi-Turn-Gedächtnis
+    - Schnellbefehle: /morgen, /abend, /todos, /kalender, /slots, /review, /undo, /suche, /status
     """
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not bot_token:
         return 0
 
-    allowed_chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
     offset = int(state.get("telegram_offset", 0))
     api_base = f"https://api.telegram.org/bot{bot_token}"
-    file_base = f"https://api.telegram.org/file/bot{bot_token}"
 
     try:
         req = request.Request(f"{api_base}/getUpdates?offset={offset}&timeout={poll_timeout}")
@@ -2022,6 +1770,7 @@ def process_telegram_updates(
     processed_dir = BASE_DIR / cfg["paths"]["processed_dir"]
     processed_dir.mkdir(parents=True, exist_ok=True)
     state_path = BASE_DIR / cfg["paths"]["local_state_file"]
+    store = get_store()
     count = 0
 
     for update in data.get("result", []):
@@ -2029,46 +1778,94 @@ def process_telegram_updates(
         state["telegram_offset"] = max(int(state.get("telegram_offset", 0)), update_id + 1)
         # WICHTIG: Offset sofort persistent speichern, damit niemals eine Nachricht mehrfach beantwortet wird!
         save_local_state(state_path, state)
-        count += 1
+
+        # 0. Inline-Button Callback-Queries behandeln
+        cq = update.get("callback_query")
+        if cq:
+            _handle_telegram_callback_query(cq, bot_token, api_base, cfg, state, state_path, notion, store)
+            count += 1
+            continue
 
         msg = update.get("message") or update.get("edited_message")
         if not msg:
             continue
 
         chat_id = str(msg.get("chat", {}).get("id", ""))
-        if allowed_chat_id and chat_id != allowed_chat_id:
-            print(f"[Telegram] Ignoriere Nachricht von unbekannter Chat-ID {chat_id}.")
+        if not telegram_ui.is_authorized_chat(chat_id, env_keys=("TELEGRAM_CHAT_ID", "TELEGRAM_ALLOWED_USERS")):
+            print(f"[Telegram] Ignoriere Nachricht von unautorisierter Chat-ID {chat_id}.")
             continue
 
-        # Chat-ID automatisch für automatische Morgen-/Abend-Briefings merken & sofort sichern
+        # Chat-ID erst NACH Autorisierung für Morgen-/Abend-Briefings merken & sichern
         if chat_id:
             state["last_telegram_chat_id"] = str(chat_id)
             try:
-                save_local_state(BASE_DIR / cfg["paths"]["local_state_file"], state)
+                save_local_state(state_path, state)
             except Exception:
                 pass
 
         raw_text = ""
         source = "Telegram"
 
-        # 1. Sprachnachricht (Voice) oder Audiodatei
+        # 1A. Sprachnachricht (Voice) oder Audiodatei
         voice_or_audio = msg.get("voice") or msg.get("audio")
         if voice_or_audio:
             file_id = voice_or_audio["file_id"]
-            try:
-                f_req = request.Request(f"{api_base}/getFile?file_id={file_id}")
-                with request.urlopen(f_req, timeout=15) as f_resp:
-                    f_info = json.loads(f_resp.read().decode("utf-8"))
-                file_path_remote = f_info["result"]["file_path"]
-                ext = Path(file_path_remote).suffix or ".ogg"
-                local_audio = processed_dir / f"tg_{update_id}{ext}"
-                with request.urlopen(f"{file_base}/{file_path_remote}", timeout=30) as dl_resp:
-                    local_audio.write_bytes(dl_resp.read())
-                raw_text = transcribe_audio(local_audio, cfg)
-                source = "Telegram"
-            except Exception as exc:
-                print(f"[Telegram] Fehler beim Laden der Sprachnachricht: {exc}")
+            local_audio = telegram_ui.download_telegram_file(bot_token, file_id, processed_dir, prefix=f"tg_{update_id}")
+            if not local_audio:
+                _send_telegram_message(api_base, chat_id, "⚠️ Sprachnachricht konnte nicht heruntergeladen werden.")
                 continue
+            raw_text = transcribe_audio(local_audio, cfg)
+            source = "Telegram"
+        # 1B. Foto (Terminzettel, Rechnung, Screenshot)
+        elif msg.get("photo"):
+            photo_id = msg["photo"][-1]["file_id"]
+            caption = (msg.get("caption") or "").strip()
+            local_img = telegram_ui.download_telegram_file(bot_token, photo_id, processed_dir, prefix=f"tg_img_{update_id}")
+            if not local_img:
+                _send_telegram_message(api_base, chat_id, "⚠️ Bild konnte nicht heruntergeladen werden.")
+                continue
+            ext = local_img.suffix.lower()
+            mime = "image/png" if ext == ".png" else ("image/webp" if ext == ".webp" else "image/jpeg")
+            mm_analysis = agent_tools.analyze_multimodal_file(local_img, mime, caption, cfg, get_date_reference_block())
+            _persist_analysis_and_reply(
+                api_base, chat_id, "Telegram (Foto)", update_id,
+                mm_analysis.get("raw_text") or caption or local_img.name,
+                mm_analysis, cfg, state, notion,
+            )
+            save_local_state(state_path, state)
+            count += 1
+            continue
+        # 1C. Dokument (PDF, Bild oder TXT/MD)
+        elif msg.get("document"):
+            doc = msg["document"]
+            file_id = doc["file_id"]
+            caption = (msg.get("caption") or "").strip()
+            fname = str(doc.get("file_name") or "")
+            doc_mime = str(doc.get("mime_type") or "")
+            local_doc = telegram_ui.download_telegram_file(bot_token, file_id, processed_dir, prefix=f"tg_doc_{update_id}")
+            if not local_doc:
+                _send_telegram_message(api_base, chat_id, "⚠️ Dokument konnte nicht heruntergeladen werden.")
+                continue
+            ext = Path(fname).suffix.lower() or local_doc.suffix.lower()
+            if ext in (".txt", ".md"):
+                file_body = local_doc.read_text(encoding="utf-8", errors="replace").strip()
+                raw_text = f"{caption}\n\n{file_body}".strip() if caption else file_body
+                source = "Telegram (Textdatei)"
+            elif ext == ".pdf" or "pdf" in doc_mime.lower() or ext in (".png", ".jpg", ".jpeg", ".webp"):
+                mime = "application/pdf" if (ext == ".pdf" or "pdf" in doc_mime.lower()) else (
+                    "image/png" if ext == ".png" else "image/jpeg"
+                )
+                mm_analysis = agent_tools.analyze_multimodal_file(local_doc, mime, caption, cfg, get_date_reference_block())
+                _persist_analysis_and_reply(
+                    api_base, chat_id, "Telegram (Dokument)", update_id,
+                    mm_analysis.get("raw_text") or caption or fname or local_doc.name,
+                    mm_analysis, cfg, state, notion,
+                )
+                save_local_state(state_path, state)
+                count += 1
+                continue
+            else:
+                raw_text = caption
         else:
             raw_text = (msg.get("text") or msg.get("caption") or "").strip()
 
@@ -2077,7 +1874,7 @@ def process_telegram_updates(
 
         cmd_lower = raw_text.lower().strip()
 
-        # 2. Direkte Bot-Kommandos (Schnellzugriff)
+        # 2. Direkte Bot-Kommandos (Schnellzugriff ohne LLM-Umweg)
         if cmd_lower in ("status", "dienst", "info", "zeitplan", "schedule", "läufe", "laeufe") or cmd_lower.startswith(("/status", "/dienst", "/info", "/zeitplan", "/schedule", "status ", "zeitplan ")):
             try:
                 sched_state = _load_scheduler_state()
@@ -2092,6 +1889,8 @@ def process_telegram_updates(
                     "briefing_morning": "☀️ Morgen-Briefing",
                     "rss_evening": "📰 RSS-Monitor Abend",
                     "briefing_evening": "🌙 Abend-Briefing",
+                    "weekly_review": "🗓️ Wochen-Review (So)",
+                    "weekly_synthesis": "🧠 RSS-Synthese (So)",
                 }
                 for j in sched_cfg.get("jobs", []):
                     jid = j.get("id", "")
@@ -2100,7 +1899,6 @@ def process_telegram_updates(
                     last_run = sched_state.get(jid)
                     already_ran_today = (last_run == today_str)
 
-                    # Nächsten Lauf exakt berechnen
                     try:
                         start_t = _parse_hhmm(jtime)
                         until_t = _parse_hhmm(j.get("catchup_until", "23:59"))
@@ -2122,9 +1920,13 @@ def process_telegram_updates(
                     else:
                         last_label = "noch nicht gelaufen"
 
-                    job_lines.append(f"• *{j_name}* ({jtime} Uhr)\n   ↳ Zuletzt: `{last_label}` | Nächster Lauf: *{next_run_str}*")
+                    job_lines.append(
+                        f"• <b>{telegram_ui.esc(j_name)}</b> ({jtime} Uhr)\n"
+                        f"   ↳ Zuletzt: <code>{telegram_ui.esc(last_label)}</code> | Nächster Lauf: <b>{telegram_ui.esc(next_run_str)}</b>"
+                    )
 
                 cal_events = fetch_google_calendar_events(days_ahead=7)
+                work_busy = calendar_sync.fetch_work_busy_slots(days_ahead=7, store=store)
                 cal_cnt = len(cal_events)
                 todo_cnt = len([t for t in state.get("tasks", []) if t.get("kind") == "To-Do" and t.get("status") != "Erledigt"])
 
@@ -2132,19 +1934,26 @@ def process_telegram_updates(
                     cal_details = []
                     for ev in cal_events[:4]:
                         t_str = f" um {ev['start_time']} Uhr" if ev.get("start_time") else " (Ganztägig)"
-                        loc_str = f" [{ev['location']}]" if ev.get("location") else ""
-                        cal_details.append(f"   ↳ *{ev.get('date')}*{t_str}: {ev.get('title')}{loc_str}")
-                    cal_section = f"📅 *Google Kalender:* {cal_cnt} Termine in den nächsten 7 Tagen:\n" + "\n".join(cal_details)
+                        loc_str = f" [{telegram_ui.esc(ev['location'])}]" if ev.get("location") else ""
+                        cal_details.append(f"   ↳ <b>{ev.get('date')}</b>{t_str}: {telegram_ui.esc(ev.get('title'))}{loc_str}")
+                    cal_section = f"📅 <b>Google Kalender:</b> {cal_cnt} Termine in den nächsten 7 Tagen:\n" + "\n".join(cal_details)
                 else:
                     has_ics = bool(os.environ.get("GOOGLE_CALENDAR_ICS_URL", "").strip())
                     has_gcal = bool(get_gcalendar_bin())
-                    if has_ics or has_gcal:
-                        cal_section = "📅 *Google Kalender:* 0 Termine in den nächsten 7 Tagen gefunden (Feed aktiv)."
+                    has_oauth = bool(os.environ.get("GOOGLE_CALENDAR_REFRESH_TOKEN", "").strip())
+                    if has_ics or has_gcal or has_oauth:
+                        cal_section = "📅 <b>Google Kalender:</b> 0 Termine in den nächsten 7 Tagen gefunden (Quelle aktiv)."
                     else:
                         cal_section = (
-                            "📅 *Google Kalender:* Keine Termine gefunden (Quelle fehlt)\n"
-                            "   ⚠️ _Tipp: Trage `GOOGLE_CALENDAR_ICS_URL` in `.env` ein (Google Kalender -> Einstellungen -> Privatadresse im iCal-Format kopieren)._"
+                            "📅 <b>Google Kalender:</b> Keine Termine gefunden (Quelle fehlt)\n"
+                            "   ⚠️ <i>Tipp: Trage GOOGLE_CALENDAR_ICS_URL oder Google OAuth2 in .env ein.</i>"
                         )
+
+                work_line = (
+                    f"\n🔒 <b>Arbeitskalender (nur Frei/Belegt):</b> {len(work_busy)} anonyme Belegt-Blöcke (7 Tage)"
+                    if work_busy
+                    else ""
+                )
 
                 import platform as _plat
                 _host = _plat.node() or "unknown"
@@ -2155,21 +1964,21 @@ def process_telegram_updates(
                         _commit = _cproc.stdout.strip()
                 except Exception:
                     pass
-                _env_label = f"`{sys.platform}` @ `{_host}` (PID `{os.getpid()}`" + (f", Commit `{_commit}`" if _commit else "") + ")"
+                _env_label = f"<code>{sys.platform}</code> @ <code>{telegram_ui.esc(_host)}</code> (PID <code>{os.getpid()}</code>" + (f", Commit <code>{telegram_ui.esc(_commit)}</code>" if _commit else "") + ")"
 
                 status_text = (
-                    f"🤖 *Assistent & Scheduler Status*\n\n"
-                    f"🖥️ *Host:* {_env_label}\n"
-                    f"🕒 *Serverzeit (Berlin):* {time_str}\n"
-                    f"💬 *Deine Chat-ID:* `{chat_id}` (aktiv registriert)\n"
-                    f"✅ *Notion Tasks:* {todo_cnt} offene Aufgaben\n"
-                    f"{cal_section}\n\n"
-                    f"⏰ *Automatischer Zeitplan (nächste Läufe):*\n" + "\n".join(job_lines) + "\n\n"
-                    f"Tipp: Mit `/morgen` oder `/abend` kannst du dein Briefing jederzeit manuell anfordern."
+                    f"🤖 <b>Assistent & Scheduler Status</b>\n\n"
+                    f"🖥️ <b>Host:</b> {_env_label}\n"
+                    f"🕒 <b>Serverzeit (Berlin):</b> {time_str}\n"
+                    f"💬 <b>Deine Chat-ID:</b> <code>{telegram_ui.esc(chat_id)}</code> (autorisiert)\n"
+                    f"✅ <b>Notion Tasks:</b> {todo_cnt} offene Aufgaben\n"
+                    f"{cal_section}{work_line}\n\n"
+                    f"⏰ <b>Automatischer Zeitplan (nächste Läufe):</b>\n" + "\n".join(job_lines) + "\n\n"
+                    f"Tipp: <code>/morgen</code>, <code>/slots</code>, <code>/todos</code> oder <code>/review</code> nutzen."
                 )
                 _send_telegram_message(api_base, chat_id, status_text)
             except Exception as s_err:
-                _send_telegram_message(api_base, chat_id, f"🤖 *Assistent Status*\n\n⚠️ Fehler beim Ermitteln des Detail-Status: {s_err}")
+                _send_telegram_message(api_base, chat_id, f"🤖 <b>Assistent Status</b>\n\n⚠️ Fehler: {telegram_ui.esc(s_err)}")
             count += 1
             continue
 
@@ -2183,37 +1992,51 @@ def process_telegram_updates(
             _send_telegram_message(
                 api_base,
                 chat_id,
-                f"👋 **Hallo Stefan! Dein persönlicher KI-Assistent ist bereit.**\n\n"
-                "Ich bin dein 100% lokaler Co-Pilot auf deinem Rechner (Ollama & Whisper) und helfe dir bei:\n\n"
-                "📅 **Kalender (Google Kalender):**\n"
-                "• Termine anlegen: *„Morgen 14 Uhr Zahnarzt eintragen“*\n"
-                "• Termine ändern: *„Verschiebe den Termin X auf 16 Uhr“*\n"
-                "• Termine absagen: *„Lösche den Termin Y“*\n"
-                "• Freie Zeit abfragen: *„Habe ich heute Nachmittag 2 Stunden frei?“*\n\n"
-                "📌 **Aufgaben & Projekte (Notion Tasks):**\n"
-                "• Aufgaben anlegen: *„Neues To-Do: Video schneiden bis 3.11. Prio Hoch“*\n"
-                "• Aufgaben anpassen: *„Verschiebe die Aufgabe Vorlesungsunterlagen auf Montag“*\n"
-                "• Aufgaben abhaken: *„Habe das Video fertig geschnitten“* oder `/erledigt <Nr>`\n"
-                "• Aufgaben löschen: *„Lösche die Aufgabe Testtask“*\n"
-                "• Aufgaben filtern: *„Welche To-Dos sind heute fällig?“*\n\n"
-                "🔍 **Wissen & Notizen (Notion AI Inbox & Docs):**\n"
-                "• Sprach- oder Textnotiz senden -> wird automatisch ausgewertet & strukturiert in Notion abgelegt\n"
-                "• Suche: *„Suche in Notion nach [Begriff]“* oder `/suche [Begriff]`\n\n"
-                "🤖 **Persönlicher Dialog & Ratgeber:**\n"
-                "• E-Mails/Nachrichten formulieren: *„Formuliere eine E-Mail an...“*\n"
-                "• Brainstorming, Fragen & Tagesplanung\n\n"
-                "⚡ **Schnellbefehle:**\n"
-                "• `/status` – Status von Assistent, Scheduler & Chat-ID prüfen\n"
-                "• `/morgen` oder `/briefing` – Dein Tages-Briefing\n"
-                "• `/abend` – Deine Abend-Checkliste\n"
-                "• `/kalender` – Terminvorschau (7 Tage)\n"
-                "• `/todos` – Offene Aufgabenliste\n"
-                "• `/ideen` – Proaktive Vorschläge\n"
-                "• `/erledigt <Nr/Name>` – Aufgabe(n) abhaken (z. B. `/erledigt 1, 3` oder `/erledigt 1-3`)\n"
-                "• `/suche <Text>` – Notion durchsuchen\n"
-                "• `/themen` – RSS-Themengebiete verwalten (/themen an|aus|neu|run)\n"
-                "• `/update` – Neuesten Code von GitHub laden & Assistenten neu starten",
+                "👋 <b>Hallo Stefan! Dein persönlicher KI-Assistent ist bereit.</b>\n\n"
+                "📅 <b>Kalender & Freie Slots:</b>\n"
+                "• <code>/kalender</code> – Terminvorschau (7 Tage)\n"
+                "• <code>/slots [heute|morgen|YYYY-MM-DD]</code> – Freie Zeitfenster (inkl. anonymer Arbeits-Blocker) &amp; Smart Time-Blocking\n"
+                "• Natürliche Sprache: <i>„Trage morgen 14 Uhr Zahnarzt ein“</i> oder <i>„Verschiebe ...“</i>\n\n"
+                "📌 <b>Aufgaben &amp; Review (Notion Tasks):</b>\n"
+                "• <code>/todos</code> – Offene Aufgaben mit Schnell-Buttons (✅ Erledigt / 📅 Morgen)\n"
+                "• <code>/erledigt 1, 3</code> – Aufgaben abhaken\n"
+                "• <code>/undo</code> – Letzte Aktion rückgängig machen\n"
+                "• <code>/review</code> – Wochen-Review &amp; Engpass-Analyse\n\n"
+                "🎙️ <b>Multimodalität &amp; Wissen:</b>\n"
+                "• Sprachnotiz, Foto (Terminzettel/Rechnung) oder PDF einfach in den Chat senden\n"
+                "• <code>/suche &lt;Begriff&gt;</code> – Notion, Notizen &amp; RSS-Wissensspeicher (BM25) durchsuchen\n"
+                "• <code>/morgen</code> / <code>/abend</code> / <code>/ideen</code> / <code>/mails</code> / <code>/themen</code> / <code>/status</code> / <code>/update</code>",
             )
+            count += 1
+            continue
+
+        if cmd_lower.startswith("/slots"):
+            parts = raw_text.split(maxsplit=1)
+            arg = parts[1].strip().lower() if len(parts) > 1 else "heute"
+            target_d = dt.date.today()
+            if arg in ("morgen", "tomorrow"):
+                target_d = dt.date.today() + dt.timedelta(days=1)
+            elif re.fullmatch(r"\d{4}-\d{2}-\d{2}", arg):
+                try:
+                    target_d = dt.date.fromisoformat(arg)
+                except Exception:
+                    pass
+            slots_html, slots_kb = _build_slots_reply(target_d, cfg, state, store)
+            _send_telegram_message(api_base, chat_id, slots_html, reply_markup=slots_kb)
+            count += 1
+            continue
+
+        if cmd_lower in ("/undo", "undo", "/rueckgaengig", "/rückgängig"):
+            res_msg = _execute_undo(store, chat_id, state, notion)
+            save_local_state(state_path, state)
+            _send_telegram_message(api_base, chat_id, res_msg)
+            count += 1
+            continue
+
+        if cmd_lower.startswith("/review"):
+            _send_telegram_message(api_base, chat_id, "🗓️ Erstelle Wochen-Review (Notion + Kalender + RSS)...")
+            review_html, _ = agent_tools.generate_weekly_review(cfg, state, notion, store)
+            _send_telegram_message(api_base, chat_id, review_html)
             count += 1
             continue
 
@@ -2241,12 +2064,13 @@ def process_telegram_updates(
                     upcoming.append(ev)
                     seen_keys.add(key)
             upcoming.sort(key=lambda x: (x.get("date") or "", x.get("start_time") or "00:00"))
+            work_busy = calendar_sync.fetch_work_busy_slots(days_ahead=7, store=store)
 
-            if not upcoming:
-                _send_telegram_message(api_base, chat_id, "📅 In den nächsten 7 Tagen stehen keine Termine im Google Kalender an.")
+            if not upcoming and not work_busy:
+                _send_telegram_message(api_base, chat_id, "📅 In den nächsten 7 Tagen stehen keine Termine im Kalender an.")
             else:
                 weekday_names = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
-                lines = ["📅 **Deine Termine der nächsten 7 Tage (Google Kalender):**"]
+                lines = ["📅 <b>Deine Termine der nächsten 7 Tage (Google Kalender):</b>"]
                 for e in upcoming:
                     d_str = e.get("date") or ""
                     try:
@@ -2255,8 +2079,10 @@ def process_telegram_updates(
                     except Exception:
                         d_label = d_str
                     t_str = f" {e['start_time']}–{e['end_time']} Uhr" if e.get("start_time") and e.get("end_time") else (f" um {e['start_time']} Uhr" if e.get("start_time") else " (Ganztägig)")
-                    loc_str = f" 📍 {e['location']}" if e.get("location") else ""
-                    lines.append(f"• **{d_label}**{t_str}: {e.get('title')}{loc_str}")
+                    loc_str = f" 📍 {telegram_ui.esc(e['location'])}" if e.get("location") else ""
+                    lines.append(f"• <b>{telegram_ui.esc(d_label)}</b>{t_str}: {telegram_ui.esc(e.get('title'))}{loc_str}")
+                if work_busy:
+                    lines.append(f"\n🔒 <i>Zusätzlich {len(work_busy)} anonyme Arbeitskalender-Blocker in <code>/slots</code> berücksichtigt.</i>")
                 _send_telegram_message(api_base, chat_id, "\n".join(lines))
             count += 1
             continue
@@ -2266,12 +2092,24 @@ def process_telegram_updates(
             if not open_todos:
                 _send_telegram_message(api_base, chat_id, "✅ Du hast aktuell keine offenen To-Dos!")
             else:
-                lines = ["📌 **Deine offenen To-Dos (Notion):**"]
+                lines = ["📌 <b>Deine offenen To-Dos (Notion):</b>"]
                 for i, t in enumerate(open_todos, 1):
                     due = f" [Fällig: {t['due_date']}]" if t.get("due_date") else ""
-                    lines.append(f"{i}. [{t.get('priority', 'Mittel')}]{due} **{t.get('title')}**")
-                lines.append("\nZum Abhaken: `/erledigt 1, 3` (mehrere), `/erledigt 1-3` (Bereich) oder per Name/Sprache!")
-                _send_telegram_message(api_base, chat_id, "\n".join(lines))
+                    area_lbl = f" [{telegram_ui.esc(t['area'])}]" if t.get("area") else ""
+                    dur_lbl = f" ~{t['estimated_minutes']}m" if t.get("estimated_minutes") else ""
+                    lines.append(
+                        f"{i}. [{telegram_ui.esc(t.get('priority', 'Mittel'))}]{area_lbl}{due}{dur_lbl} "
+                        f"<b>{telegram_ui.esc(t.get('title'))}</b>"
+                    )
+                lines.append("\nZum Abhaken: <code>/erledigt 1, 3</code>, <code>/erledigt 1-3</code> oder Schnell-Buttons:")
+                kb_rows: list[list[tuple[str, str]]] = []
+                for idx in range(1, min(3, len(open_todos)) + 1):
+                    kb_rows.append([
+                        (f"✅ #{idx} erledigen", f"done:{idx}"),
+                        (f"📅 #{idx} auf morgen", f"defer:{idx}"),
+                    ])
+                markup = telegram_ui.build_inline_keyboard(kb_rows) if kb_rows else None
+                _send_telegram_message(api_base, chat_id, "\n".join(lines), reply_markup=markup)
             count += 1
             continue
 
@@ -2288,9 +2126,9 @@ def process_telegram_updates(
             if not recent_sugs:
                 _send_telegram_message(api_base, chat_id, "💡 Aktuell keine offenen KI-Vorschläge.")
             else:
-                lines = ["💡 **Proaktive Vorschläge aus deinen letzten Notizen:**"]
+                lines = ["💡 <b>Proaktive Vorschläge aus deinen letzten Notizen:</b>"]
                 for i, s in enumerate(recent_sugs, 1):
-                    lines.append(f"{i}. **{s.get('title')}**\n   ↳ {s.get('next_step', '')}")
+                    lines.append(f"{i}. <b>{telegram_ui.esc(s.get('title'))}</b>\n   ↳ {telegram_ui.esc(s.get('next_step', ''))}")
                 _send_telegram_message(api_base, chat_id, "\n".join(lines))
             count += 1
             continue
@@ -2299,7 +2137,7 @@ def process_telegram_updates(
             _send_telegram_message(api_base, chat_id, "📬 Prüfe markierte E-Mails (Label: Assistent)...")
             mail_count = process_emails(cfg, state, notion, model_override=model_override)
             if mail_count > 0:
-                _send_telegram_message(api_base, chat_id, f"✅ {mail_count} neue E-Mail(s) ausgewertet und in Notion AI Inbox & Tasks übertragen.")
+                _send_telegram_message(api_base, chat_id, f"✅ {mail_count} neue E-Mail(s) ausgewertet und in Notion AI Inbox &amp; Tasks übertragen.")
             else:
                 _send_telegram_message(api_base, chat_id, "ℹ️ Keine neuen ungelesenen E-Mails mit dem Label 'Assistent' gefunden.")
             count += 1
@@ -2319,47 +2157,54 @@ def process_telegram_updates(
                     api_base,
                     chat_id,
                     "ℹ️ Bitte Nummer(n) oder Name(n) angeben, z. B.:\n"
-                    "• `/erledigt 1, 3` (mehrere auf einmal)\n"
-                    "• `/erledigt 1-3` (Bereich von 1 bis 3)\n"
-                    "• `/erledigt Video schneiden` (nach Name/Stichwort)\n\n"
-                    "📋 Liste deiner Aufgaben anzeigen: `/todos`",
+                    "• <code>/erledigt 1, 3</code> (mehrere auf einmal)\n"
+                    "• <code>/erledigt 1-3</code> (Bereich von 1 bis 3)\n"
+                    "• <code>/erledigt Video schneiden</code> (nach Name/Stichwort)\n\n"
+                    "📋 Liste deiner Aufgaben anzeigen: <code>/todos</code>",
                 )
                 count += 1
                 continue
 
             target_tasks = resolve_tasks_to_complete(arg, open_todos)
             if target_tasks:
+                page_ids: list[str] = []
+                titles_done: list[str] = []
                 for t in target_tasks:
                     t["status"] = "Erledigt"
+                    titles_done.append(t.get("title", ""))
                     n_page_id = t.get("notion_page_id")
+                    if n_page_id:
+                        page_ids.append(n_page_id)
                     if notion and n_page_id:
                         try:
                             notion.mark_task_done(n_page_id)
                         except Exception as _e:
                             print(f"[Notion Task Error] {_e}")
+                store.push_undo("main", chat_id, "reopen_tasks", {"page_ids": page_ids, "titles": titles_done})
                 save_local_state(state_path, state)
 
                 if len(target_tasks) == 1:
-                    resp = f"✅ Als erledigt markiert:\n• **{target_tasks[0].get('title')}**"
+                    resp = f"✅ Als erledigt markiert:\n• <b>{telegram_ui.esc(target_tasks[0].get('title'))}</b>"
                 else:
-                    titles = "\n".join(f"• **{t.get('title')}**" for t in target_tasks)
-                    resp = f"✅ **{len(target_tasks)} Aufgaben als erledigt markiert:**\n{titles}"
+                    titles = "\n".join(f"• <b>{telegram_ui.esc(t.get('title'))}</b>" for t in target_tasks)
+                    resp = f"✅ <b>{len(target_tasks)} Aufgaben als erledigt markiert:</b>\n{titles}"
 
                 remaining = [t for t in open_todos if t not in target_tasks]
                 if remaining:
-                    resp += f"\n\n📋 Noch *{len(remaining)} offene Aufgabe(n)* (Liste mit `/todos`)."
+                    resp += f"\n\n📋 Noch <i>{len(remaining)} offene Aufgabe(n)</i> (Liste mit <code>/todos</code>)."
                 else:
-                    resp += "\n\n🎉 *Alle offenen To-Dos erledigt!*"
+                    resp += "\n\n🎉 <b>Alle offenen To-Dos erledigt!</b>"
 
-                _send_telegram_message(api_base, chat_id, resp)
+                markup = telegram_ui.build_inline_keyboard([[("↩️ Rückgängig", "undo:last")]])
+                _send_telegram_message(api_base, chat_id, resp, reply_markup=markup)
                 count += 1
                 continue
             else:
                 _send_telegram_message(
                     api_base,
                     chat_id,
-                    f"⚠️ Konnte keine passende offene Aufgabe zu „{arg}“ finden.\n"
-                    f"Nutze `/todos` für die aktuelle Nummernliste.",
+                    f"⚠️ Konnte keine passende offene Aufgabe zu „{telegram_ui.esc(arg)}“ finden.\n"
+                    f"Nutze <code>/todos</code> für die aktuelle Nummernliste.",
                 )
                 count += 1
                 continue
@@ -2368,26 +2213,40 @@ def process_telegram_updates(
             parts = raw_text.split(maxsplit=1)
             search_query = parts[1].strip() if len(parts) > 1 else ""
             if not search_query:
-                _send_telegram_message(api_base, chat_id, "Bitte Suchbegriff angeben, z. B. `/suche Life on Pause`.")
+                _send_telegram_message(api_base, chat_id, "Bitte Suchbegriff angeben, z. B. <code>/suche Life on Pause</code>.")
                 count += 1
                 continue
             notion_results = notion.search_workspace(search_query, limit=5) if notion else []
+            rss_hits = store.search_knowledge_bm25(search_query, limit=5)
             matching_notes = [
                 it for it in state.get("items", [])
                 if search_query.lower() in (it.get("raw_text") or "").lower() or search_query.lower() in (it.get("analysis", {}).get("title") or "").lower()
             ]
-            lines = [f"🔍 **Suchergebnisse für „{search_query}“:**\n"]
+            lines = [f"🔍 <b>Suchergebnisse für „{telegram_ui.esc(search_query)}“:</b>\n"]
             if notion_results:
-                lines.append("📄 **Notion-Seiten:**")
+                lines.append("📄 <b>Notion-Seiten:</b>")
                 for r in notion_results[:4]:
-                    lines.append(f"• [{r['title']}]({r['url']})")
+                    url = r.get("url", "")
+                    t_lbl = telegram_ui.esc(r.get("title", "Seite"))
+                    lines.append(f'• <a href="{telegram_ui.esc(url)}">{t_lbl}</a>' if url else f"• {t_lbl}")
+                lines.append("")
+            if rss_hits:
+                lines.append("📡 <b>RSS-Wissensspeicher (BM25):</b>")
+                for rh in rss_hits[:4]:
+                    r_url = rh.get("link", "")
+                    r_lbl = telegram_ui.esc(rh.get("title", "Artikel"))
+                    lines.append(
+                        f'• [{telegram_ui.esc(rh.get("topic_id", ""))}] <a href="{telegram_ui.esc(r_url)}">{r_lbl}</a>'
+                        if r_url
+                        else f"• [{telegram_ui.esc(rh.get('topic_id', ''))}] {r_lbl}"
+                    )
                 lines.append("")
             if matching_notes:
-                lines.append("🎙️ **Notizen-Verlauf:**")
+                lines.append("🎙️ <b>Notizen-Verlauf:</b>")
                 for n in matching_notes[:3]:
-                    lines.append(f"• **{n.get('analysis', {}).get('title')}**: {n.get('analysis', {}).get('summary')}")
-            if not notion_results and not matching_notes:
-                lines.append("Keine Treffer in Notion oder Notizen gefunden.")
+                    lines.append(f"• <b>{telegram_ui.esc(n.get('analysis', {}).get('title'))}</b>: {telegram_ui.esc(n.get('analysis', {}).get('summary'))}")
+            if not notion_results and not rss_hits and not matching_notes:
+                lines.append("Keine Treffer in Notion, RSS-Wissensspeicher oder Notizen gefunden.")
             _send_telegram_message(api_base, chat_id, "\n".join(lines))
             count += 1
             continue
@@ -2403,8 +2262,7 @@ def process_telegram_updates(
 
         if cmd_lower in ("/run", "/sync", "run", "sync") or cmd_lower.startswith(("/run ", "/sync ")):
             _send_telegram_message(api_base, chat_id, "📡 RSS-Monitor gestartet. Neue Funde werden gleich gemeldet...")
-            import threading
-            def _async_rss():
+            def _async_rss_run():
                 try:
                     import rss_monitor
                     import argparse as _ap
@@ -2412,7 +2270,7 @@ def process_telegram_updates(
                     rss_monitor.run(ns)
                 except Exception as _e:
                     print(f"[RSS Telegram Run Error] {_e}")
-            threading.Thread(target=_async_rss, daemon=True).start()
+            threading.Thread(target=_async_rss_run, daemon=True).start()
             count += 1
             continue
 
@@ -2427,66 +2285,65 @@ def process_telegram_updates(
                 if subcmd in ("list", "show", "liste"):
                     feeds_cfg = rss_monitor.load_feeds_config()
                     topics = feeds_cfg.get("topics", [])
-                    lines = [f"📡 **Deine RSS-Themengebiete ({len(topics)}):**\n"]
+                    lines = [f"📡 <b>Deine RSS-Themengebiete ({len(topics)}):</b>\n"]
                     for t in topics:
                         st = "🟢" if t.get("enabled", True) else "⚪ (inaktiv)"
-                        lines.append(f"{st} {t.get('emoji', '📌')} **{t['name']}** (`{t['id']}`)")
-                        lines.append(f"   _{len(t.get('sources', []))} Quellen_")
-                    lines.append("\n⚡ **Befehle:**")
-                    lines.append("• `/themen an <id>` – Thema aktivieren")
-                    lines.append("• `/themen aus <id>` – Thema pausieren")
-                    lines.append("• `/themen neu <Name>` – Neues Thema per KI generieren")
-                    lines.append("• `/themen run` – Jetzt sofort Feeds abfragen")
+                        lines.append(f"{st} {t.get('emoji', '📌')} <b>{telegram_ui.esc(t['name'])}</b> (<code>{telegram_ui.esc(t['id'])}</code>)")
+                        lines.append(f"   <i>{len(t.get('sources', []))} Quellen</i>")
+                    lines.append("\n⚡ <b>Befehle:</b>")
+                    lines.append("• <code>/themen an &lt;id&gt;</code> – Thema aktivieren")
+                    lines.append("• <code>/themen aus &lt;id&gt;</code> – Thema pausieren")
+                    lines.append("• <code>/themen neu &lt;Name&gt;</code> – Neues Thema per KI generieren")
+                    lines.append("• <code>/themen run</code> – Jetzt sofort Feeds abfragen")
                     _send_telegram_message(api_base, chat_id, "\n".join(lines))
                     count += 1
                     continue
 
                 elif subcmd in ("an", "on", "enable", "aktivieren"):
                     if not arg:
-                        _send_telegram_message(api_base, chat_id, "Bitte Themen-ID angeben, z. B. `/themen an parkinson`.")
+                        _send_telegram_message(api_base, chat_id, "Bitte Themen-ID angeben, z. B. <code>/themen an parkinson</code>.")
                         count += 1
                         continue
                     ok = rss_monitor.cmd_topic_set_enabled(arg, True)
                     if ok:
-                        _send_telegram_message(api_base, chat_id, f"🟢 Thema `{arg}` wurde aktiviert.")
+                        _send_telegram_message(api_base, chat_id, f"🟢 Thema <code>{telegram_ui.esc(arg)}</code> wurde aktiviert.")
                     else:
-                        _send_telegram_message(api_base, chat_id, f"❌ Thema `{arg}` nicht gefunden.")
+                        _send_telegram_message(api_base, chat_id, f"❌ Thema <code>{telegram_ui.esc(arg)}</code> nicht gefunden.")
                     count += 1
                     continue
 
                 elif subcmd in ("aus", "off", "disable", "deaktivieren"):
                     if not arg:
-                        _send_telegram_message(api_base, chat_id, "Bitte Themen-ID angeben, z. B. `/themen aus parkinson`.")
+                        _send_telegram_message(api_base, chat_id, "Bitte Themen-ID angeben, z. B. <code>/themen aus parkinson</code>.")
                         count += 1
                         continue
                     ok = rss_monitor.cmd_topic_set_enabled(arg, False)
                     if ok:
-                        _send_telegram_message(api_base, chat_id, f"⚪ Thema `{arg}` wurde deaktiviert.")
+                        _send_telegram_message(api_base, chat_id, f"⚪ Thema <code>{telegram_ui.esc(arg)}</code> wurde deaktiviert.")
                     else:
-                        _send_telegram_message(api_base, chat_id, f"❌ Thema `{arg}` nicht gefunden.")
+                        _send_telegram_message(api_base, chat_id, f"❌ Thema <code>{telegram_ui.esc(arg)}</code> nicht gefunden.")
                     count += 1
                     continue
 
                 elif subcmd in ("neu", "add", "anlegen"):
                     new_name = arg or (parts[1] if len(parts) > 1 and parts[1] not in ("neu", "add") else "")
                     if not new_name:
-                        _send_telegram_message(api_base, chat_id, "Bitte Namen des neuen Themas angeben, z. B. `/themen neu Multiple Sklerose`.")
+                        _send_telegram_message(api_base, chat_id, "Bitte Namen des neuen Themas angeben, z. B. <code>/themen neu Multiple Sklerose</code>.")
                         count += 1
                         continue
-                    _send_telegram_message(api_base, chat_id, f"⏳ Generiere Feeds & Kriterien für „{new_name}“ per KI...")
+                    _send_telegram_message(api_base, chat_id, f"⏳ Generiere Feeds &amp; Kriterien für „{telegram_ui.esc(new_name)}“ per KI...")
                     import argparse as _ap
                     ns = _ap.Namespace(name=new_name, id=None, emoji=None, focus=None, rss=None, auto=True)
                     ok = rss_monitor.cmd_topic_add(ns)
                     if ok:
-                        _send_telegram_message(api_base, chat_id, f"✅ Thema **{new_name}** wurde mit KI-generierten Quellen erfolgreich angelegt und aktiviert!")
+                        _send_telegram_message(api_base, chat_id, f"✅ Thema <b>{telegram_ui.esc(new_name)}</b> wurde mit KI-generierten Quellen erfolgreich angelegt und aktiviert!")
                     else:
-                        _send_telegram_message(api_base, chat_id, f"❌ Konnte Thema **{new_name}** nicht anlegen.")
+                        _send_telegram_message(api_base, chat_id, f"❌ Konnte Thema <b>{telegram_ui.esc(new_name)}</b> nicht anlegen.")
                     count += 1
                     continue
 
                 elif subcmd in ("run", "sync", "start"):
                     _send_telegram_message(api_base, chat_id, "📡 RSS-Monitor gestartet. Neue Funde werden gleich gemeldet...")
-                    import threading
                     def _async_rss():
                         try:
                             import argparse as _ap
@@ -2499,11 +2356,11 @@ def process_telegram_updates(
                     continue
 
                 else:
-                    _send_telegram_message(api_base, chat_id, "Unbekannter Befehl. Nutze `/themen` für die Übersicht.")
+                    _send_telegram_message(api_base, chat_id, "Unbekannter Befehl. Nutze <code>/themen</code> für die Übersicht.")
                     count += 1
                     continue
             except Exception as exc:
-                _send_telegram_message(api_base, chat_id, f"Fehler bei /themen: {exc}")
+                _send_telegram_message(api_base, chat_id, f"Fehler bei /themen: {telegram_ui.esc(exc)}")
                 count += 1
                 continue
 
@@ -2518,17 +2375,41 @@ def process_telegram_updates(
             budget.step(extra_text_len=len(raw_text))
         except chat_guard.ChatBudgetExceeded as bexc:
             print(f"[Telegram Chat-Guard] {bexc}")
-            _send_telegram_message(api_base, chat_id, f"⚠️ {bexc}")
+            _send_telegram_message(api_base, chat_id, f"⚠️ {telegram_ui.esc(bexc)}")
             count += 1
             continue
 
-        # 4. Umfassendes Intent-Routing via KI (Jev / Gemini Flash-Lite / lokales Modell)
+        # 3B. Multi-Tool Function Calling Agent (Gemini mit Multi-Turn-Memory & StepBudget)
+        if chat_cfg.get("enable_tool_agent", True):
+            tool_res = agent_tools.run_tool_agent(
+                user_text=raw_text,
+                chat_id=chat_id,
+                cfg=cfg,
+                state=state,
+                notion=notion,
+                store=store,
+                date_ref_block=get_date_reference_block(),
+                find_matching_task_fn=find_matching_task,
+                resolve_tasks_fn=resolve_tasks_to_complete,
+                find_gcal_event_fn=find_matching_google_calendar_event,
+                handle_cal_events_fn=handle_extracted_calendar_events,
+                save_state_fn=lambda: save_local_state(state_path, state),
+            )
+            if tool_res is not None:
+                reply_html, has_undo = tool_res
+                markup = telegram_ui.build_inline_keyboard([[("↩️ Rückgängig", "undo:last")]]) if has_undo else None
+                _send_telegram_message(api_base, chat_id, reply_html, reply_markup=markup)
+                save_local_state(state_path, state)
+                count += 1
+                continue
+
+        # 4. Klassisches Intent-Routing als Fallback (z. B. Ollama-Betrieb)
         print(f"[Telegram Router] Analysiere Nachricht: '{raw_text[:60]}...'")
         intent_info = classify_intent(raw_text, cfg, model_override=model_override)
         intent = intent_info.get("intent", "NOTE_OR_TASK")
         print(f"[Telegram Router] Erkannter Intent: {intent}")
 
-        # 0) FEEDBACK_OR_CORRECTION: Stefan korrigiert ein Missverständnis oder falschen Eintrag
+        # 0) FEEDBACK_OR_CORRECTION
         if intent == "FEEDBACK_OR_CORRECTION":
             details = intent_info.get("correction_details") or raw_text
             print(f"[Telegram Feedback] Behandle Korrektur: '{details}'...")
@@ -2542,11 +2423,11 @@ Aktueller Kalender & To-Dos:
 Antworte Stefan direkt, freundlich und hilfsbereit auf Deutsch. Bestätige ihm die Korrektur oder erkläre kurz, wie es nun angepasst ist.
 WICHTIG: Erstelle daraus KEINE neue Aufgabe in Notion Tasks."""
             reply = call_llm_text(prompt_fix, cfg, model_override=model_override)
-            _send_telegram_message(api_base, chat_id, f"🫡 {reply}")
+            _send_telegram_message(api_base, chat_id, f"🫡 {telegram_ui.esc(reply)}")
             count += 1
             continue
 
-        # A) RESCHEDULE_EVENT: Bestehenden Termin im Google Kalender ändern
+        # A) RESCHEDULE_EVENT
         if intent == "RESCHEDULE_EVENT":
             ev_title = intent_info.get("event_title") or ""
             new_date = intent_info.get("new_date")
@@ -2578,8 +2459,8 @@ WICHTIG: Erstelle daraus KEINE neue Aufgabe in Notion Tasks."""
                     _send_telegram_message(
                         api_base,
                         chat_id,
-                        f"📅 **Termin erfolgreich verschoben:**\n"
-                        f"• {matched['title']}\n"
+                        f"📅 <b>Termin erfolgreich verschoben:</b>\n"
+                        f"• {telegram_ui.esc(matched['title'])}\n"
                         f"• Neues Datum/Zeit: {target_date}{time_str}\n\n"
                         f"✅ Direkt im Google Kalender aktualisiert.",
                     )
@@ -2589,23 +2470,23 @@ WICHTIG: Erstelle daraus KEINE neue Aufgabe in Notion Tasks."""
                     _send_telegram_message(
                         api_base,
                         chat_id,
-                        f"⚠️ Termin '{matched['title']}' gefunden, aber Google Kalender konnte nicht aktualisiert werden.",
+                        f"⚠️ Termin '{telegram_ui.esc(matched['title'])}' gefunden, aber Google Kalender konnte nicht aktualisiert werden.",
                     )
                     count += 1
                     continue
             else:
                 upcoming = fetch_google_calendar_events(days_ahead=7)
-                upcoming_lines = "\n".join(f"• {e['title']} ({e['date']} {e.get('start_time') or ''})" for e in upcoming[:5])
+                upcoming_lines = "\n".join(f"• {telegram_ui.esc(e['title'])} ({e['date']} {e.get('start_time') or ''})" for e in upcoming[:5])
                 _send_telegram_message(
                     api_base,
                     chat_id,
-                    f"⚠️ Ich konnte keinen passenden Termin zu '{ev_title}' im Kalender finden.\n\n"
+                    f"⚠️ Ich konnte keinen passenden Termin zu '{telegram_ui.esc(ev_title)}' im Kalender finden.\n\n"
                     f"Deine nächsten Termine:\n{upcoming_lines or 'Keine anstehenden Termine gefunden.'}",
                 )
                 count += 1
                 continue
 
-        # B) DELETE_EVENT: Termin im Google Kalender löschen / absagen
+        # B) DELETE_EVENT
         if intent == "DELETE_EVENT":
             ev_title = intent_info.get("event_title") or ""
             target_date = intent_info.get("new_date")
@@ -2613,28 +2494,30 @@ WICHTIG: Erstelle daraus KEINE neue Aufgabe in Notion Tasks."""
             if matched and matched.get("id"):
                 ok = delete_google_calendar_event(matched["id"])
                 if ok:
+                    store.push_undo("main", chat_id, "restore_event", matched)
                     state["calendar_events"] = [
                         e for e in state.get("calendar_events", [])
                         if e.get("title") != matched.get("title")
                     ]
+                    markup = telegram_ui.build_inline_keyboard([[("↩️ Rückgängig", "undo:last")]])
                     _send_telegram_message(
                         api_base,
                         chat_id,
-                        f"🗑️ Termin **{matched['title']}** ({matched.get('date')}) wurde aus deinem Google Kalender gelöscht.",
+                        f"🗑️ Termin <b>{telegram_ui.esc(matched['title'])}</b> ({matched.get('date')}) wurde aus deinem Google Kalender gelöscht.",
+                        reply_markup=markup,
                     )
                     count += 1
                     continue
             _send_telegram_message(
                 api_base,
                 chat_id,
-                f"⚠️ Konnte keinen Termin zu '{ev_title}' im Google Kalender zum Löschen finden.",
+                f"⚠️ Konnte keinen Termin zu '{telegram_ui.esc(ev_title)}' im Google Kalender zum Löschen finden.",
             )
             count += 1
             continue
 
-        # C) CREATE_EVENT: Expliziten neuen Kalendertermin anlegen
+        # C) CREATE_EVENT
         if intent == "CREATE_EVENT":
-            # Falls die Nachricht mehrere Termine, To-Dos oder Aufzählungen enthält, als umfassende Notiz verarbeiten!
             multi_words = ("außerdem", "und auch", "und am", "sowie", "zudem", "und außerdem", "und um", "danach", "sowie am", "und eine")
             has_multi = any(w in raw_text.lower() for w in multi_words) or len(re.findall(r"\d{1,2}(?::\d{2})?\s*uhr", raw_text.lower())) > 1
             if has_multi:
@@ -2659,24 +2542,35 @@ WICHTIG: Erstelle daraus KEINE neue Aufgabe in Notion Tasks."""
                     notion=notion,
                     tasks_db_id=cfg["notion"]["tasks_database_id"],
                 )
+                has_undo = False
+                if created_cal and created_cal[0].get("gcal_event_id"):
+                    store.push_undo(
+                        "main",
+                        chat_id,
+                        "delete_event",
+                        {"event_id": created_cal[0]["gcal_event_id"], "title": ev_title},
+                    )
+                    has_undo = True
                 time_str = f" ({ev_start}–{ev_end} Uhr)" if ev_start and ev_end else (f" ({ev_start} Uhr)" if ev_start else " (Ganztägig)")
+                markup = telegram_ui.build_inline_keyboard([[("↩️ Rückgängig", "undo:last")]]) if has_undo else None
                 _send_telegram_message(
                     api_base,
                     chat_id,
-                    f"📅 **Neuer Termin eingetragen:**\n• **{ev_title}** am {ev_date}{time_str}\n\nIn Google Kalender & Notion Erinnerungen gesichert.",
+                    f"📅 <b>Neuer Termin eingetragen:</b>\n• <b>{telegram_ui.esc(ev_title)}</b> am {ev_date}{time_str}\n\nIn Google Kalender &amp; Notion Erinnerungen gesichert.",
+                    reply_markup=markup,
                 )
                 count += 1
                 continue
 
-        # D) QUERY_CALENDAR: Frage zu Terminen, Zeitplan oder freier Zeit
+        # D) QUERY_CALENDAR
         if intent == "QUERY_CALENDAR":
             print(f"[Telegram Kalender-Abfrage] Beantworte: '{raw_text}'...")
             answer = answer_question(raw_text, state, cfg, notion=notion, model_override=model_override)
-            _send_telegram_message(api_base, chat_id, f"📅 {answer}")
+            _send_telegram_message(api_base, chat_id, f"📅 {telegram_ui.esc(answer)}")
             count += 1
             continue
 
-        # E) UPDATE_TASK: Bestehende Aufgabe in Notion verschieben / Priorität ändern
+        # E) UPDATE_TASK
         if intent == "UPDATE_TASK":
             task_q = intent_info.get("task_title") or raw_text
             new_date = intent_info.get("new_date")
@@ -2705,11 +2599,11 @@ WICHTIG: Erstelle daraus KEINE neue Aufgabe in Notion Tasks."""
                 _send_telegram_message(
                     api_base,
                     chat_id,
-                    f"📌 **Aufgabe aktualisiert:**\n"
-                    f"• **{matched_task.get('title')}**\n"
+                    f"📌 <b>Aufgabe aktualisiert:</b>\n"
+                    f"• <b>{telegram_ui.esc(matched_task.get('title'))}</b>\n"
                     f"• {due_text}\n"
-                    f"• Priorität: {target_prio}\n\n"
-                    f"✅ In Notion & lokal aktualisiert.",
+                    f"• Priorität: {telegram_ui.esc(target_prio)}\n\n"
+                    f"✅ In Notion &amp; lokal aktualisiert.",
                 )
                 count += 1
                 continue
@@ -2717,27 +2611,31 @@ WICHTIG: Erstelle daraus KEINE neue Aufgabe in Notion Tasks."""
                 _send_telegram_message(
                     api_base,
                     chat_id,
-                    f"⚠️ Konnte keine offene Aufgabe zu '{task_q}' finden. Liste deine Aufgaben mit `/todos` auf.",
+                    f"⚠️ Konnte keine offene Aufgabe zu '{telegram_ui.esc(task_q)}' finden. Liste deine Aufgaben mit <code>/todos</code> auf.",
                 )
                 count += 1
                 continue
 
-        # F) DELETE_TASK: Aufgabe in Notion löschen / archivieren
+        # F) DELETE_TASK
         if intent == "DELETE_TASK":
             task_q = intent_info.get("task_title") or raw_text
             open_todos = [t for t in state.get("tasks", []) if t.get("kind") == "To-Do" and t.get("status") != "Erledigt"]
             matched_task = find_matching_task(task_q, open_todos)
             if matched_task:
-                if notion and matched_task.get("notion_page_id"):
+                n_id = matched_task.get("notion_page_id")
+                if notion and n_id:
                     try:
-                        notion.archive_task(matched_task["notion_page_id"])
+                        notion.archive_task(n_id)
                     except Exception:
                         pass
+                store.push_undo("main", chat_id, "reopen_task", {"page_id": n_id, "title": matched_task.get("title", "")})
                 state["tasks"] = [t for t in state.get("tasks", []) if t != matched_task]
+                markup = telegram_ui.build_inline_keyboard([[("↩️ Rückgängig", "undo:last")]])
                 _send_telegram_message(
                     api_base,
                     chat_id,
-                    f"🗑️ Aufgabe **{matched_task.get('title')}** wurde aus Notion archiviert/gelöscht.",
+                    f"🗑️ Aufgabe <b>{telegram_ui.esc(matched_task.get('title'))}</b> wurde aus Notion archiviert/gelöscht.",
+                    reply_markup=markup,
                 )
                 count += 1
                 continue
@@ -2745,99 +2643,116 @@ WICHTIG: Erstelle daraus KEINE neue Aufgabe in Notion Tasks."""
                 _send_telegram_message(
                     api_base,
                     chat_id,
-                    f"⚠️ Konnte keine offene Aufgabe zu '{task_q}' zum Löschen finden.",
+                    f"⚠️ Konnte keine offene Aufgabe zu '{telegram_ui.esc(task_q)}' zum Löschen finden.",
                 )
                 count += 1
                 continue
 
-        # G) COMPLETE_TASK: Aufgabe / To-Do als erledigt markieren
+        # G) COMPLETE_TASK
         if intent == "COMPLETE_TASK":
             task_title_q = intent_info.get("task_title") or raw_text
             open_todos = [t for t in state.get("tasks", []) if t.get("kind") == "To-Do" and t.get("status") != "Erledigt"]
-            
+
             target_tasks = resolve_tasks_to_complete(raw_text, open_todos)
             if not target_tasks and task_title_q != raw_text:
                 target_tasks = resolve_tasks_to_complete(task_title_q, open_todos)
 
             if target_tasks:
+                page_ids = []
+                titles_done = []
                 for t in target_tasks:
                     t["status"] = "Erledigt"
+                    titles_done.append(t.get("title", ""))
                     n_id = t.get("notion_page_id")
+                    if n_id:
+                        page_ids.append(n_id)
                     if notion and n_id:
                         try:
                             notion.mark_task_done(n_id)
                         except Exception as _e:
                             print(f"[Notion Task Error] {_e}")
+                store.push_undo("main", chat_id, "reopen_tasks", {"page_ids": page_ids, "titles": titles_done})
                 save_local_state(state_path, state)
 
                 if len(target_tasks) == 1:
-                    resp = f"✅ In Notion & lokal als erledigt markiert:\n• **{target_tasks[0].get('title')}**"
+                    resp = f"✅ In Notion &amp; lokal als erledigt markiert:\n• <b>{telegram_ui.esc(target_tasks[0].get('title'))}</b>"
                 else:
-                    titles = "\n".join(f"• **{t.get('title')}**" for t in target_tasks)
-                    resp = f"✅ In Notion & lokal als erledigt markiert ({len(target_tasks)} Aufgaben):\n{titles}"
+                    titles = "\n".join(f"• <b>{telegram_ui.esc(t.get('title'))}</b>" for t in target_tasks)
+                    resp = f"✅ In Notion &amp; lokal als erledigt markiert ({len(target_tasks)} Aufgaben):\n{titles}"
 
                 remaining = [t for t in open_todos if t not in target_tasks]
                 if remaining:
-                    resp += f"\n\n📋 Noch *{len(remaining)} offene Aufgabe(n)* (Übersicht mit `/todos`)."
+                    resp += f"\n\n📋 Noch <i>{len(remaining)} offene Aufgabe(n)</i> (Übersicht mit <code>/todos</code>)."
                 else:
-                    resp += "\n\n🎉 *Alle offenen To-Dos erledigt!*"
+                    resp += "\n\n🎉 <b>Alle offenen To-Dos erledigt!</b>"
 
-                _send_telegram_message(api_base, chat_id, resp)
+                markup = telegram_ui.build_inline_keyboard([[("↩️ Rückgängig", "undo:last")]])
+                _send_telegram_message(api_base, chat_id, resp, reply_markup=markup)
                 count += 1
                 continue
             else:
                 _send_telegram_message(
                     api_base,
                     chat_id,
-                    f"⚠️ Konnte keine passende offene Aufgabe zu '{task_title_q}' finden (Übersicht mit `/todos`).",
+                    f"⚠️ Konnte keine passende offene Aufgabe zu '{telegram_ui.esc(task_title_q)}' finden (Übersicht mit <code>/todos</code>).",
                 )
                 count += 1
                 continue
 
-        # H) QUERY_TASKS: Nach Aufgaben filtern / fragen
+        # H) QUERY_TASKS
         if intent == "QUERY_TASKS":
             print(f"[Telegram Aufgaben-Abfrage] Beantworte: '{raw_text}'...")
             answer = answer_question(raw_text, state, cfg, notion=notion, model_override=model_override)
-            _send_telegram_message(api_base, chat_id, f"📌 {answer}")
+            _send_telegram_message(api_base, chat_id, f"📌 {telegram_ui.esc(answer)}")
             count += 1
             continue
 
-        # I) SEARCH_KNOWLEDGE: Wissen in Notion durchsuchen
+        # I) SEARCH_KNOWLEDGE
         if intent == "SEARCH_KNOWLEDGE":
             search_q = intent_info.get("query") or raw_text
             notion_results = notion.search_workspace(search_q, limit=5) if notion else []
+            rss_hits = store.search_knowledge_bm25(search_q, limit=4)
             matching_notes = [
                 it for it in state.get("items", [])
                 if search_q.lower() in (it.get("raw_text") or "").lower() or search_q.lower() in (it.get("analysis", {}).get("title") or "").lower()
             ]
-            lines = [f"🔍 **Suchergebnisse für „{search_q}“:**\n"]
+            lines = [f"🔍 <b>Suchergebnisse für „{telegram_ui.esc(search_q)}“:</b>\n"]
             if notion_results:
-                lines.append("📄 **Notion-Seiten:**")
+                lines.append("📄 <b>Notion-Seiten:</b>")
                 for r in notion_results[:4]:
-                    lines.append(f"• [{r['title']}]({r['url']})")
+                    url = r.get("url", "")
+                    t_lbl = telegram_ui.esc(r.get("title", "Seite"))
+                    lines.append(f'• <a href="{telegram_ui.esc(url)}">{t_lbl}</a>' if url else f"• {t_lbl}")
+                lines.append("")
+            if rss_hits:
+                lines.append("📡 <b>RSS-Wissensspeicher:</b>")
+                for rh in rss_hits[:4]:
+                    lines.append(f"• [{telegram_ui.esc(rh.get('topic_id', ''))}] {telegram_ui.esc(rh.get('title', ''))}")
                 lines.append("")
             if matching_notes:
-                lines.append("🎙️ **Notizen-Verlauf:**")
+                lines.append("🎙️ <b>Notizen-Verlauf:</b>")
                 for n in matching_notes[:3]:
-                    lines.append(f"• **{n.get('analysis', {}).get('title')}**: {n.get('analysis', {}).get('summary')}")
-            if not notion_results and not matching_notes:
+                    lines.append(f"• <b>{telegram_ui.esc(n.get('analysis', {}).get('title'))}</b>: {telegram_ui.esc(n.get('analysis', {}).get('summary'))}")
+            if not notion_results and not rss_hits and not matching_notes:
                 lines.append("Keine Treffer in Notion oder Notizen gefunden.")
             _send_telegram_message(api_base, chat_id, "\n".join(lines))
             count += 1
             continue
 
-        # J) GENERAL_CHAT: Freie Frage, Formulierungshilfe, Brainstorming, Coaching
+        # J) GENERAL_CHAT
         if intent == "GENERAL_CHAT" or is_question_message(raw_text):
             q_clean = intent_info.get("query") or raw_text
             if cmd_lower.startswith(("/ask", "/frage")) and " " in raw_text:
                 q_clean = raw_text.split(maxsplit=1)[1]
             print(f"[Telegram Dialog] Beantworte: '{q_clean}'...")
             answer = answer_question(q_clean, state, cfg, notion=notion, model_override=model_override)
-            _send_telegram_message(api_base, chat_id, f"🤖 {answer}")
+            store.append_chat_turn("main", chat_id, "user", raw_text)
+            store.append_chat_turn("main", chat_id, "assistant", answer)
+            _send_telegram_message(api_base, chat_id, f"🤖 {telegram_ui.esc(answer)}")
             count += 1
             continue
 
-        # K) NOTE_OR_TASK (Default): Sprachnotiz / Textnotiz erfassen -> Notion AI Inbox & Tasks & Kalender
+        # K) NOTE_OR_TASK (Default)
         print(f"[Telegram Notiz] Werte Nachricht aus: '{raw_text[:60]}...'")
         analysis = analyze_note(
             title="Telegram-Notiz",
@@ -2845,112 +2760,32 @@ WICHTIG: Erstelle daraus KEINE neue Aufgabe in Notion Tasks."""
             cfg=cfg,
             model_override=model_override,
         )
-        suggestions_str = format_suggestions_text(analysis["suggestions"])
-
-        inbox_page_id: str | None = None
-        if notion:
-            inbox_page_id = notion.create_inbox_page(
-                inbox_db_id=cfg["notion"]["inbox_database_id"],
-                title=analysis["title"],
-                source=source,
-                raw_text=raw_text,
-                summary=analysis["summary"],
-                suggestions_text=suggestions_str,
-            )
-            for todo in analysis["todos"]:
-                notion.create_task_page(
-                    tasks_db_id=cfg["notion"]["tasks_database_id"],
-                    title=todo.get("title", "Aufgabe"),
-                    kind="To-Do",
-                    priority=todo.get("priority", "Mittel"),
-                    due_date=todo.get("due_date"),
-                    next_step=todo.get("next_step", ""),
-                    inbox_page_id=inbox_page_id,
-                )
-            # Hinweis: KI-Vorschläge werden NICHT als Tasks angelegt, um die Aufgabenliste nicht zu überladen.
-
-        record = {
-            "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
-            "file": f"telegram_{update_id}",
-            "source": source,
-            "raw_text": raw_text,
-            "analysis": analysis,
-            "notion_inbox_page_id": inbox_page_id,
-            "synced_to_notion": bool(inbox_page_id),
-        }
-        state["items"].append(record)
-        for todo in analysis["todos"]:
-            state["tasks"].append({
-                "kind": "To-Do",
-                "title": todo.get("title", ""),
-                "priority": todo.get("priority", "Mittel"),
-                "due_date": todo.get("due_date"),
-                "next_step": todo.get("next_step", ""),
-                "source_title": analysis["title"],
-                "status": "Nicht begonnen",
-            })
-
-        created_cal = handle_extracted_calendar_events(
-            events=analysis.get("calendar_events", []),
-            source_title=analysis["title"],
-            state=state,
-            notion=notion,
-            tasks_db_id=cfg["notion"]["tasks_database_id"],
-            inbox_page_id=inbox_page_id,
+        _persist_analysis_and_reply(
+            api_base, chat_id, source, update_id, raw_text, analysis, cfg, state, notion
         )
-
-        # Kurze Bestätigung direkt in Telegram zurücksenden
-        todo_lines = "\n".join(f"• {t.get('title')} ({t.get('priority', 'Mittel')})" for t in analysis["todos"]) or "Keine direkten To-Dos"
-        cal_lines = (
-            "\n".join(
-                f"• {c.get('title')} ({c.get('date')} {c.get('start_time') or 'Ganztägig'})"
-                for c in created_cal
-            )
-            or "Keine Termine"
-        )
-        sug_lines = "\n".join(f"• {s.get('title')}" for s in analysis["suggestions"]) or "Keine"
-        reply = (
-            f"✅ Ausgewertet: {analysis['title']}\n\n"
-            f"📝 {analysis['summary']}\n\n"
-            f"📌 To-Dos:\n{todo_lines}\n\n"
-            f"📅 Kalendereinträge:\n{cal_lines}\n\n"
-            f"💡 Vorschläge:\n{sug_lines}"
-        )
-        _send_telegram_message(api_base, chat_id, reply)
         count += 1
 
     return count
 
 
-def _send_telegram_message(api_base: str, chat_id: str, text: str) -> bool:
-    """Sendet Nachricht an Telegram. Teilt Texte > 3900 Zeichen automatisch in Chunks und loggt Fehler."""
+def _send_telegram_message(
+    api_base: str,
+    chat_id: str,
+    text: str,
+    parse_mode: str = "HTML",
+    reply_markup: dict[str, Any] | None = None,
+) -> bool:
+    """Sendet Nachricht an Telegram über das gehärtete UI-Transportmodul (inkl. HTML->Plaintext Fallback)."""
     if not api_base or not chat_id or not text:
         return False
-    success = True
-    for i in range(0, len(text), 3900):
-        chunk = text[i:i + 3900]
-        try:
-            payload = json.dumps({"chat_id": chat_id, "text": chunk}).encode("utf-8")
-            req = request.Request(
-                f"{api_base}/sendMessage",
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with request.urlopen(req, timeout=15) as resp:
-                if resp.status != 200:
-                    success = False
-        except error.HTTPError as he:
-            try:
-                err_body = he.read().decode("utf-8", errors="replace")
-            except Exception:
-                err_body = str(he.reason)
-            print(f"[Telegram Fehler] HTTP {he.code} an {chat_id}: {err_body}")
-            success = False
-        except Exception as exc:
-            print(f"[Telegram Fehler] Senden an {chat_id} fehlgeschlagen: {exc}")
-            success = False
-    return success
+    token = api_base.rsplit("/bot", 1)[-1] if "/bot" in api_base else api_base
+    return telegram_ui.send_message(
+        token=token,
+        chat_id=chat_id,
+        text=text,
+        parse_mode=parse_mode,
+        reply_markup=reply_markup,
+    )
 
 
 def process_notion_inbox(
@@ -2979,6 +2814,7 @@ def process_notion_inbox(
         print(f"[Notion Inbox] Werte '{title}' aus...")
         analysis = analyze_note(title, raw_text, cfg, model_override=model_override)
         suggestions_str = format_suggestions_text(analysis["suggestions"])
+        note_area = analysis.get("area") or agent_tools.detect_area(raw_text)
 
         notion.update_inbox_page(
             page_id=page_id,
@@ -2995,6 +2831,8 @@ def process_notion_inbox(
                 due_date=todo.get("due_date"),
                 next_step=todo.get("next_step", ""),
                 inbox_page_id=page_id,
+                area=todo.get("area") or note_area,
+                estimated_minutes=todo.get("estimated_minutes"),
             )
         # Hinweis: KI-Vorschläge werden NICHT als Tasks angelegt, um die Aufgabenliste nicht zu überladen.
         handle_extracted_calendar_events(
@@ -3021,6 +2859,26 @@ def show_windows_notification(title: str, message: str) -> None:
         toast(title, message)
     except Exception:
         pass
+
+
+def _resolve_primary_chat_id(state: dict[str, Any]) -> str:
+    """Ermittelt die Telegram-Ziel-Chat-ID aus ENV oder lokalem Cache."""
+    chat_id = (
+        os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+        or os.environ.get("TELEGRAM_RSS_CHAT_ID", "").strip()
+        or str(state.get("last_telegram_chat_id", "")).strip()
+    )
+    if not chat_id:
+        rss_state_file = BASE_DIR / "rss_state.json"
+        if rss_state_file.exists():
+            r_st = safe_read_json(rss_state_file, {})
+            if isinstance(r_st, dict):
+                chat_id = str(r_st.get("last_rss_chat_id", "")).strip()
+    if not chat_id:
+        allowed = os.environ.get("TELEGRAM_ALLOWED_USERS", "").strip()
+        if allowed and (allowed.isdigit() or (allowed.startswith("-") and allowed[1:].isdigit())):
+            chat_id = allowed
+    return chat_id
 
 
 def generate_briefing(
@@ -3051,49 +2909,89 @@ def generate_briefing(
     today_cal = [ev for ev in all_cal if ev.get("date") == today_iso]
     upcoming_cal = [ev for ev in all_cal if (ev.get("date") or "") > today_iso]
 
+    # STRIKT ANONYME Arbeitskalender-Belegtzeiten (nur Free/Busy-Intervalle für Slot-Berechnung)
+    store = get_store()
+    work_busy: list[dict[str, Any]] = []
+    try:
+        work_busy = calendar_sync.fetch_work_busy_slots(days_ahead=3 if mode == "evening" else 2, store=store)
+    except Exception:
+        work_busy = []
+    today_work_busy = [wb for wb in work_busy if wb.get("date") == today_iso]
+
+    target_slot_date = (dt.date.today() + dt.timedelta(days=1)).isoformat() if mode == "evening" else today_iso
+    work_hours = cfg.get("work_hours", {})
+    work_start = os.environ.get("WORK_HOURS_START") or work_hours.get("start", "08:00")
+    work_end = os.environ.get("WORK_HOURS_END") or work_hours.get("end", "20:00")
+    free_slots = calendar_sync.compute_free_slots(
+        all_cal + work_busy,
+        target_date=target_slot_date,
+        work_start=work_start,
+        work_end=work_end,
+        min_slot_minutes=30,
+    )
+    focus_blocks = calendar_sync.suggest_time_blocks(free_slots, open_todos, max_suggestions=2)
+
     if mode == "evening":
-        header = f"🌙 Abend-Checkliste & Rückblick ({today_iso})"
+        header = f"🌙 <b>Abend-Checkliste & Rückblick ({today_iso})</b>"
     else:
-        header = f"☀️ Guten Morgen Stefan! Dein Tages-Briefing ({today_iso})"
+        header = f"☀️ <b>Guten Morgen Stefan! Dein Tages-Briefing ({today_iso})</b>"
 
     lines = [header, ""]
 
     if mode == "evening":
-        lines.append(f"🎙️ Heute neu erfasste Notizen ({len(today_items)}):")
+        lines.append(f"🎙️ <b>Heute neu erfasste Notizen ({len(today_items)}):</b>")
         if today_items:
             for idx, it in enumerate(today_items, 1):
                 a = it.get("analysis", {})
-                lines.append(f"  {idx}. {a.get('title', 'Notiz')} – {a.get('summary', '')}")
+                lines.append(f"  {idx}. {telegram_ui.esc(a.get('title', 'Notiz'))} – {telegram_ui.esc(a.get('summary', ''))}")
         else:
             lines.append("  Heute wurden keine neuen Sprach-/Textnotizen erfasst.")
         lines.append("")
 
-    # Heutige Termine
+    # Heutige private Termine
     if today_cal:
-        lines.append(f"📅 Heutige Termine ({len(today_cal)}):")
+        lines.append(f"📅 <b>Heutige Termine ({len(today_cal)}):</b>")
         for idx, ev in enumerate(today_cal, 1):
             t_str = f" {ev['start_time']}–{ev.get('end_time') or ''} Uhr" if ev.get("start_time") else " (Ganztägig)"
-            loc_str = f" [Ort: {ev['location']}]" if ev.get("location") else ""
-            lines.append(f"  {idx}. [{t_str.strip()}]{loc_str} {ev.get('title')}")
+            loc_str = f" [Ort: {telegram_ui.esc(ev['location'])}]" if ev.get("location") else ""
+            lines.append(f"  {idx}. [{t_str.strip()}]{loc_str} {telegram_ui.esc(ev.get('title'))}")
     else:
-        lines.append("📅 Heutige Termine: Keine Termine für heute im Google Kalender eingetragen.")
+        lines.append("📅 <b>Heutige Termine:</b> Keine Termine für heute im Google Kalender eingetragen.")
+
+    if today_work_busy:
+        lines.append(f"🔒 <i>Arbeitskalender: {len(today_work_busy)} anonyme Belegt-Blöcke (nur Frei/Belegt) berücksichtigt</i>")
+
+    if free_slots:
+        slot_lbl = "morgen" if mode == "evening" else "heute"
+        lines.append("")
+        lines.append(f"⏳ <b>Freie Zeitfenster ({slot_lbl}):</b>")
+        for sl in free_slots[:4]:
+            lines.append(f"  • {sl['start_time']}–{sl['end_time']} Uhr ({sl['duration_minutes']} Min.)")
+
+    if focus_blocks:
+        lines.append("🎯 <b>Fokus-Empfehlung:</b>")
+        for fb in focus_blocks:
+            lines.append(
+                f"  • {fb['start_time']}–{fb['end_time']}: <b>{telegram_ui.esc(fb['task_title'])}</b>"
+            )
 
     # Vorschau auf nächste Tage
     if upcoming_cal:
         lines.append("")
-        lines.append("🗓️ Vorschau auf anstehende Termine:")
+        lines.append("🗓️ <b>Vorschau auf anstehende Termine:</b>")
         for idx, ev in enumerate(upcoming_cal[:4], 1):
             t_str = f" ({ev['start_time']} Uhr)" if ev.get("start_time") else ""
-            lines.append(f"  • {ev.get('date')}{t_str}: {ev.get('title')}")
+            lines.append(f"  • {ev.get('date')}{t_str}: {telegram_ui.esc(ev.get('title'))}")
 
     lines.append("")
-    lines.append(f"📌 Offene To-Dos ({len(open_todos)}):")
+    lines.append(f"📌 <b>Offene To-Dos ({len(open_todos)}):</b>")
     if open_todos:
         for idx, t in enumerate(open_todos, 1):
             due = f" [Fällig: {t['due_date']}]" if t.get("due_date") else ""
-            lines.append(f"  {idx}. [{t.get('priority', 'Mittel')}]{due} {t.get('title')}")
+            area_lbl = f" [{telegram_ui.esc(t['area'])}]" if t.get("area") else ""
+            lines.append(f"  {idx}. [{telegram_ui.esc(t.get('priority', 'Mittel'))}]{area_lbl}{due} {telegram_ui.esc(t.get('title'))}")
             if t.get("next_step"):
-                lines.append(f"     -> Nächster Schritt: {t['next_step']}")
+                lines.append(f"     ↳ Nächster Schritt: {telegram_ui.esc(t['next_step'])}")
     else:
         lines.append("  Keine offenen To-Dos im System.")
 
@@ -3110,13 +3008,13 @@ def generate_briefing(
 
     if recent_suggestions:
         lines.append("")
-        lines.append(f"💡 KI-Impulse aus deinen letzten Notizen ({len(recent_suggestions)}):")
+        lines.append(f"💡 <b>KI-Impulse aus deinen letzten Notizen ({len(recent_suggestions)}):</b>")
         for idx, s in enumerate(recent_suggestions, 1):
-            step = f" -> {s['next_step']}" if s.get("next_step") else ""
-            lines.append(f"  • **{s.get('title')}**{step}")
+            step = f" → {telegram_ui.esc(s['next_step'])}" if s.get("next_step") else ""
+            lines.append(f"  • <b>{telegram_ui.esc(s.get('title'))}</b>{step}")
 
     if mode == "evening" and open_todos:
-        lines.append("\nTipp: Antworte direkt hier im Chat mit `/erledigt 1, 3` oder `/erledigt <Name>`, um Aufgaben abzuhaken!")
+        lines.append("\nTipp: Nutze die Buttons unten, <code>/erledigt 1, 3</code> oder <code>/slots morgen</code>.")
 
     text = "\n".join(lines)
     if notify and (open_todos or suggestions or all_cal):
@@ -3131,7 +3029,7 @@ def generate_briefing(
         else:
             top_focus = "Fokus"
         show_windows_notification(
-            header,
+            telegram_ui.strip_html_tags(header),
             f"{len(today_cal)} Termine heute, {len(open_todos)} To-Dos. Fokus: {top_focus}",
         )
 
@@ -3140,23 +3038,7 @@ def generate_briefing(
             os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
             or os.environ.get("TELEGRAM_RSSBOT_TOKEN", "").strip()
         )
-        chat_id = (
-            os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-            or os.environ.get("TELEGRAM_RSS_CHAT_ID", "").strip()
-            or str(state.get("last_telegram_chat_id", "")).strip()
-        )
-        if not chat_id:
-            rss_state_file = BASE_DIR / "rss_state.json"
-            if rss_state_file.exists():
-                try:
-                    r_st = json.loads(rss_state_file.read_text(encoding="utf-8"))
-                    chat_id = str(r_st.get("last_rss_chat_id", "")).strip()
-                except Exception:
-                    pass
-        if not chat_id:
-            allowed = os.environ.get("TELEGRAM_ALLOWED_USERS", "").strip()
-            if allowed and (allowed.isdigit() or (allowed.startswith("-") and allowed[1:].isdigit())):
-                chat_id = allowed
+        chat_id = _resolve_primary_chat_id(state)
 
         # Fallback für Server ohne gesetztes TELEGRAM_CHAT_ID: Letzte Chat-ID direkt aus Telegram getUpdates abfragen
         if not chat_id and bot_token:
@@ -3167,19 +3049,28 @@ def generate_briefing(
                     for u in reversed(gu_data.get("result", [])):
                         m = u.get("message") or u.get("edited_message")
                         if m and m.get("chat", {}).get("id"):
-                            chat_id = str(m["chat"]["id"])
-                            state["last_telegram_chat_id"] = chat_id
-                            try:
-                                save_local_state(BASE_DIR / cfg["paths"]["local_state_file"], state)
-                            except Exception:
-                                pass
-                            break
+                            cand_id = str(m["chat"]["id"])
+                            if telegram_ui.is_authorized_chat(cand_id):
+                                chat_id = cand_id
+                                state["last_telegram_chat_id"] = chat_id
+                                try:
+                                    save_local_state(BASE_DIR / cfg["paths"]["local_state_file"], state)
+                                except Exception:
+                                    pass
+                                break
             except Exception:
                 pass
 
         if bot_token and chat_id:
             api_base = f"https://api.telegram.org/bot{bot_token}"
-            ok = _send_telegram_message(api_base, chat_id, text)
+            kb_rows: list[list[tuple[str, str]]] = []
+            for idx in range(1, min(2, len(open_todos)) + 1):
+                kb_rows.append([
+                    (f"✅ #{idx} erledigen", f"done:{idx}"),
+                    (f"📅 #{idx} auf morgen", f"defer:{idx}"),
+                ])
+            reply_markup = telegram_ui.build_inline_keyboard(kb_rows) if kb_rows else None
+            ok = _send_telegram_message(api_base, chat_id, text, reply_markup=reply_markup)
             if ok:
                 print(f"[Telegram] {mode.capitalize()}-Briefing an Chat-ID {chat_id} gesendet.")
             else:
@@ -3210,7 +3101,6 @@ def perform_self_update() -> tuple[bool, str]:
             timeout=60,
         )
         if pull_proc.returncode != 0:
-            # Fallback mit explizitem stash
             subprocess.run(["git", "stash"], cwd=BASE_DIR, capture_output=True, timeout=15)
             pull_proc = subprocess.run(
                 ["git", "pull"],
@@ -3222,7 +3112,7 @@ def perform_self_update() -> tuple[bool, str]:
 
         if pull_proc.returncode != 0:
             err = pull_proc.stderr.strip() or pull_proc.stdout.strip()
-            return False, f"❌ `git pull` fehlgeschlagen:\n```\n{err}\n```"
+            return False, f"❌ <code>git pull</code> fehlgeschlagen:\n<pre>{telegram_ui.esc(err[:800])}</pre>"
 
         pull_out = pull_proc.stdout.strip()
         already_up_to_date = "Already up to date" in pull_out or "Bereits aktuell" in pull_out
@@ -3240,17 +3130,18 @@ def perform_self_update() -> tuple[bool, str]:
         # setzen wir den Status dafür in scheduler_state.json zurück, damit der Neustart es nachholt.
         try:
             if SCHEDULER_STATE_PATH.exists():
-                st_data = json.loads(SCHEDULER_STATE_PATH.read_text(encoding="utf-8"))
-                st_data.pop("briefing_morning", None)
-                st_data.pop("briefing_evening", None)
-                SCHEDULER_STATE_PATH.write_text(json.dumps(st_data, indent=2), encoding="utf-8")
+                st_data = safe_read_json(SCHEDULER_STATE_PATH, {})
+                if isinstance(st_data, dict):
+                    st_data.pop("briefing_morning", None)
+                    st_data.pop("briefing_evening", None)
+                    atomic_write_json(SCHEDULER_STATE_PATH, st_data, indent=2)
         except Exception:
             pass
 
         if already_up_to_date:
             msg = (
-                f"✅ *Das System ist bereits auf dem neuesten Stand!*\n\n"
-                f"📌 *Aktueller Commit:*\n`{commit_info}`\n\n"
+                f"✅ <b>Das System ist bereits auf dem neuesten Stand!</b>\n\n"
+                f"📌 <b>Aktueller Commit:</b>\n<code>{telegram_ui.esc(commit_info)}</code>\n\n"
                 f"⚡ Starte Dienst neu, um alle Module frisch zu laden..."
             )
             return True, msg
@@ -3267,17 +3158,17 @@ def perform_self_update() -> tuple[bool, str]:
             if pip_proc.returncode == 0:
                 pip_note = "\n📦 Neue Python-Pakete wurden installiert."
             else:
-                pip_note = f"\n⚠️ Warnung bei pip install: {pip_proc.stderr[:120]}"
+                pip_note = f"\n⚠️ Warnung bei pip install: {telegram_ui.esc(pip_proc.stderr[:120])}"
 
         msg = (
-            f"🔄 *Update erfolgreich heruntergeladen!*\n\n"
-            f"📌 *Neuer Commit:*\n`{commit_info}`\n"
+            f"🔄 <b>Update erfolgreich heruntergeladen!</b>\n\n"
+            f"📌 <b>Neuer Commit:</b>\n<code>{telegram_ui.esc(commit_info)}</code>\n"
             f"{pip_note}\n\n"
             f"⚡ Starte Dienst jetzt neu..."
         )
         return True, msg
     except Exception as exc:
-        return False, f"❌ Fehler beim Aktualisieren: {exc}"
+        return False, f"❌ Fehler beim Aktualisieren: {telegram_ui.esc(exc)}"
 
 
 def trigger_restart() -> None:
@@ -3319,6 +3210,7 @@ SCHEDULER_RETRY_COOLDOWN: dict[str, float] = {}
 
 # Standard-Zeitplan (überschreibbar via config.json -> "schedule").
 # "catchup_until": Bis zu dieser Uhrzeit wird ein verpasster Lauf (z. B. nach Neustart) noch nachgeholt.
+# "day_of_week": Optional 0=Mo .. 6=So (z. B. 6 für Sonntags-Review & RSS-Synthese)
 DEFAULT_SCHEDULE: dict[str, Any] = {
     "enabled": True,
     "timezone": "Europe/Berlin",
@@ -3329,6 +3221,10 @@ DEFAULT_SCHEDULE: dict[str, Any] = {
         {"id": "rss_evening", "time": "18:30", "catchup_until": "23:59", "command": ["rss_monitor.py", "run"]},
         {"id": "briefing_evening", "time": "19:30", "catchup_until": "23:59",
          "command": ["assistant.py", "briefing", "--mode", "evening", "--telegram"]},
+        {"id": "weekly_review", "day_of_week": 6, "time": "18:00", "catchup_until": "23:59",
+         "command": ["assistant.py", "review"]},
+        {"id": "weekly_synthesis", "day_of_week": 6, "time": "18:15", "catchup_until": "23:59",
+         "command": ["rss_bot.py"]},
     ],
 }
 
@@ -3347,15 +3243,13 @@ def _parse_hhmm(value: str) -> dt.time:
 
 
 def _load_scheduler_state() -> dict[str, Any]:
-    try:
-        return json.loads(SCHEDULER_STATE_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    data = safe_read_json(SCHEDULER_STATE_PATH, {})
+    return data if isinstance(data, dict) else {}
 
 
 def _save_scheduler_state(sched_state: dict[str, Any]) -> None:
     try:
-        SCHEDULER_STATE_PATH.write_text(json.dumps(sched_state, indent=2, ensure_ascii=False), encoding="utf-8")
+        atomic_write_json(SCHEDULER_STATE_PATH, sched_state, indent=2)
     except Exception as exc:
         print(f"[Scheduler] Konnte Zustand nicht speichern: {exc}")
 
@@ -3366,7 +3260,7 @@ def run_scheduled_jobs(
     state: dict[str, Any] | None = None,
     notion: NotionClient | None = None,
 ) -> None:
-    """Startet fällige Zeitplan-Jobs (RSS-Monitor, Morgen-/Abend-Briefing) im Hintergrund.
+    """Startet fällige Zeitplan-Jobs (RSS-Monitor, Briefings, Sonntags-Review/Synthese) im Hintergrund.
 
     Ersetzt den Windows Task Scheduler, damit der Daemon auch unter Linux/GCP alles selbst erledigt.
     `running` hält aktive Threads & Prozesse (job_id -> Thread/Popen), damit nichts doppelt startet.
@@ -3394,6 +3288,8 @@ def run_scheduled_jobs(
         job_id = job.get("id")
         if not job_id or job.get("enabled", True) is False or job_id in running:
             continue
+        if "day_of_week" in job and now.weekday() != int(job["day_of_week"]):
+            continue
         if SCHEDULER_RETRY_COOLDOWN.get(job_id, 0) > time.time():
             continue
         if sched_state.get(job_id) == today:
@@ -3408,7 +3304,6 @@ def run_scheduled_jobs(
             continue
 
         # A) Briefing-Jobs direkt im In-Memory-Thread des Daemons ausführen
-        # Nutzt aktiven Notion-Client, Kalender-Cache und verhindert Subprozess-Fehler
         if "briefing" in job_id and state is not None:
             mode = "evening" if "evening" in job_id else "morning"
 
@@ -3435,7 +3330,6 @@ def run_scheduled_jobs(
                 except Exception as exc:
                     SCHEDULER_RETRY_COOLDOWN[jid] = time.time() + 300
                     print(f"[Scheduler Fehler] Briefing-Job '{jid}' fehlgeschlagen (erneuter Versuch in 5 Min.): {exc}")
-                    import traceback
                     traceback.print_exc()
 
             t = threading.Thread(target=_briefing_worker, daemon=True)
@@ -3460,7 +3354,6 @@ def run_scheduled_jobs(
                 except Exception as exc:
                     SCHEDULER_RETRY_COOLDOWN[jid] = time.time() + 300
                     print(f"[Scheduler Fehler] RSS-Job '{jid}' fehlgeschlagen (erneuter Versuch in 5 Min.): {exc}")
-                    import traceback
                     traceback.print_exc()
 
             t = threading.Thread(target=_rss_worker, daemon=True)
@@ -3468,7 +3361,59 @@ def run_scheduled_jobs(
             running[job_id] = t
             continue
 
-        # C) Generischer Fallback für sonstige externe Befehle als Subprozess
+        # C) Sonntags-Wochenreview
+        if job_id == "weekly_review" and state is not None:
+            def _review_worker(jid=job_id, d=today):
+                try:
+                    print("[Scheduler] Starte Weekly-Review...")
+                    if notion:
+                        try:
+                            state["tasks"] = notion.query_open_tasks(cfg["notion"]["tasks_database_id"])
+                        except Exception:
+                            pass
+                    review_html, _ = agent_tools.generate_weekly_review(cfg, state, notion, get_store())
+                    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+                    chat_id = _resolve_primary_chat_id(state)
+                    if bot_token and chat_id:
+                        telegram_ui.send_message(bot_token, chat_id, review_html)
+                    st = _load_scheduler_state()
+                    st[jid] = d
+                    _save_scheduler_state(st)
+                    SCHEDULER_RETRY_COOLDOWN.pop(jid, None)
+                except Exception as exc:
+                    SCHEDULER_RETRY_COOLDOWN[jid] = time.time() + 300
+                    print(f"[Scheduler Fehler] Weekly-Review fehlgeschlagen: {exc}")
+
+            t = threading.Thread(target=_review_worker, daemon=True)
+            t.start()
+            running[job_id] = t
+            continue
+
+        # D) Sonntags-RSS-Synthese
+        if job_id == "weekly_synthesis":
+            def _synth_worker(jid=job_id, d=today):
+                try:
+                    print("[Scheduler] Starte wöchentliche RSS-Synthese...")
+                    import rss_bot
+                    rss_token = os.environ.get("TELEGRAM_RSSBOT_TOKEN", "").strip()
+                    rss_chat_id = os.environ.get("TELEGRAM_RSS_CHAT_ID", "").strip() or _resolve_primary_chat_id(state or {})
+                    if rss_token and rss_chat_id:
+                        synth_html = rss_bot.handle_synthese(rss_chat_id)
+                        rss_bot.send_message(rss_token, rss_chat_id, synth_html)
+                    st = _load_scheduler_state()
+                    st[jid] = d
+                    _save_scheduler_state(st)
+                    SCHEDULER_RETRY_COOLDOWN.pop(jid, None)
+                except Exception as exc:
+                    SCHEDULER_RETRY_COOLDOWN[jid] = time.time() + 300
+                    print(f"[Scheduler Fehler] RSS-Synthese fehlgeschlagen: {exc}")
+
+            t = threading.Thread(target=_synth_worker, daemon=True)
+            t.start()
+            running[job_id] = t
+            continue
+
+        # E) Generischer Fallback für sonstige externe Befehle als Subprozess
         cmd = [sys.executable] + [str(BASE_DIR / job["command"][0])] + list(job["command"][1:])
         try:
             log_fh = open(SCHEDULER_LOG_PATH, "a", encoding="utf-8")
@@ -3492,10 +3437,12 @@ def run_daemon(
 ) -> None:
     """
     Echtzeit-Hintergrunddienst (Daemon):
-    - Long-Polling auf Telegram (Antwort in 1–2 Sekunden statt 15 Minuten Wartezeit)
-    - Prüft regelmäßig lokale Dateien, Notion Inbox und markierte E-Mails
+    - Long-Polling auf Telegram (Antwort in 1–2 Sekunden)
+    - Pre-Meeting-Briefings (40 Min vor privaten Terminen)
+    - Zeitplan (Morgen-/Abend-Briefing, RSS-Monitor, Sonntags-Review & Synthese)
+    - Regelmäßige Sync-Schleife (Drop-Ordner, Mails, Notion Inbox)
     """
-    import time
+    setup_logging()
 
     pid_file = BASE_DIR / "daemon.pid"
     if pid_file.exists():
@@ -3533,31 +3480,36 @@ def run_daemon(
         pass
 
     print(f"[Daemon] Echtzeit-Assistent gestartet (PID {os.getpid()}). Warte auf Telegram-Nachrichten...")
-    
+
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if bot_token:
+        telegram_ui.register_bot_commands(bot_token, telegram_ui.MAIN_BOT_COMMANDS)
+
     # Dedizierten RSS- & Wissensspeicher-Bot starten, falls konfiguriert
     if os.environ.get("TELEGRAM_RSSBOT_TOKEN", "").strip():
         try:
             import rss_bot
             rss_bot.start_in_background()
-            print("[Daemon] Dedizierter RSS-Bot (@RSS8472Bot) erfolgreich im Hintergrund gestartet.")
+            print("[Daemon] Dedizierter RSS-Bot erfolgreich im Hintergrund gestartet.")
         except Exception as _e:
             print(f"[Daemon] Hinweis: Konnte RSS-Bot nicht starten: {_e}")
 
     last_full_sync = 0.0
     scheduled_procs: dict[str, Any] = {}
+    store = get_store()
 
     try:
         while True:
             state = load_local_state(state_path)
             now = time.time()
 
-            # Zeitplan: RSS 07:30/18:30, Briefing 08:00/19:30 (Europe/Berlin), holt verpasste Läufe nach
+            # Zeitplan: RSS 07:30/18:30, Briefing 08:00/19:30, So Review/Synthese
             try:
                 run_scheduled_jobs(cfg, scheduled_procs, state=state, notion=notion)
             except Exception as exc:
                 print(f"[Scheduler Hinweis] {exc}")
 
-            # Alle 5 Minuten: Offene Tasks aus Notion aktualisieren, Drop-Ordner, Mails & Notion Inbox prüfen
+            # Alle 5 Minuten: Offene Tasks, Drop-Ordner, Mails, Notion Inbox & Pre-Meeting-Pings prüfen
             if now - last_full_sync >= 300:
                 last_full_sync = now
                 if notion:
@@ -3574,6 +3526,17 @@ def run_daemon(
                     save_local_state(state_path, state)
                 except Exception as exc:
                     print(f"[Daemon Sync Hinweis] {exc}")
+
+                # Pre-Meeting-Briefings (z. B. 40 Min vor privatem Termin)
+                try:
+                    lead_min = int(cfg.get("pre_meeting_lead_minutes", 40))
+                    pings = agent_tools.check_upcoming_meeting_pings(cfg, state, notion, store, lead_minutes=lead_min)
+                    chat_id = _resolve_primary_chat_id(state)
+                    if pings and bot_token and chat_id:
+                        for p_html in pings:
+                            telegram_ui.send_message(bot_token, chat_id, p_html)
+                except Exception as exc:
+                    print(f"[Pre-Meeting Ping Hinweis] {exc}")
 
             # Echtzeit-Telegram-Abfrage (Long-Polling bis zu 20s)
             try:
@@ -3605,13 +3568,14 @@ def run_daemon(
 def main() -> None:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    parser = argparse.ArgumentParser(description="Lokaler Notion- & Sprachnotiz-Assistent (Ollama)")
+    setup_logging()
+    parser = argparse.ArgumentParser(description="Persönlicher Notion-, Kalender- & Sprachnotiz-Assistent")
     parser.add_argument(
         "command",
-        choices=["run", "daemon", "briefing", "add", "sync-calendar"],
+        choices=["run", "daemon", "briefing", "review", "add", "sync-calendar"],
         nargs="?",
         default="run",
-        help="run = Einmaliger Sync | daemon = Echtzeit-Hintergrunddienst | briefing = Morgen-/Abend-Briefing | add = schnelle Textnotiz | sync-calendar = Termine synchronisieren",
+        help="run = Einmaliger Sync | daemon = Echtzeit-Hintergrunddienst | briefing = Morgen-/Abend-Briefing | review = Wochen-Review | add = schnelle Textnotiz | sync-calendar = Termine synchronisieren",
     )
     parser.add_argument("--text", help="Direkter Notiztext für das Kommando 'add'")
     parser.add_argument("--title", default="Schnellnotiz", help="Titel für 'add'")
@@ -3647,6 +3611,16 @@ def main() -> None:
         synced = sync_pending_calendar_events(state)
         save_local_state(state_path, state)
         print(f"[Fertig] {synced} Kalendereinträge mit Google Kalender synchronisiert.")
+        return
+
+    if args.command == "review":
+        review_html, _ = agent_tools.generate_weekly_review(cfg, state, notion, get_store())
+        print(telegram_ui.strip_html_tags(review_html))
+        if args.telegram:
+            bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+            chat_id = _resolve_primary_chat_id(state)
+            if bot_token and chat_id:
+                telegram_ui.send_message(bot_token, chat_id, review_html)
         return
 
     if args.command == "add":
