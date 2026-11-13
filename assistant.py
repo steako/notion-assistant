@@ -2146,8 +2146,20 @@ def process_telegram_updates(
                             "   ⚠️ _Tipp: Trage `GOOGLE_CALENDAR_ICS_URL` in `.env` ein (Google Kalender -> Einstellungen -> Privatadresse im iCal-Format kopieren)._"
                         )
 
+                import platform as _plat
+                _host = _plat.node() or "unknown"
+                _commit = ""
+                try:
+                    _cproc = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=BASE_DIR, capture_output=True, text=True, timeout=3)
+                    if _cproc.returncode == 0:
+                        _commit = _cproc.stdout.strip()
+                except Exception:
+                    pass
+                _env_label = f"`{sys.platform}` @ `{_host}` (PID `{os.getpid()}`" + (f", Commit `{_commit}`" if _commit else "") + ")"
+
                 status_text = (
                     f"🤖 *Assistent & Scheduler Status*\n\n"
+                    f"🖥️ *Host:* {_env_label}\n"
                     f"🕒 *Serverzeit (Berlin):* {time_str}\n"
                     f"💬 *Deine Chat-ID:* `{chat_id}` (aktiv registriert)\n"
                     f"✅ *Notion Tasks:* {todo_cnt} offene Aufgaben\n"

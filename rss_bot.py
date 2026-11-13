@@ -449,8 +449,20 @@ def handle_status(chat_id: str) -> str:
     rss_st = load_rss_state()
     seen_cnt = len(rss_st.get("seen", {})) // 2  # Link + Title Hash pro Eintrag
 
+    import platform as _plat
+    _host = _plat.node() or "unknown"
+    _commit = ""
+    try:
+        _cproc = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=BASE_DIR, capture_output=True, text=True, timeout=3)
+        if _cproc.returncode == 0:
+            _commit = _cproc.stdout.strip()
+    except Exception:
+        pass
+    _env_label = f"`{sys.platform}` @ `{_host}` (PID `{os.getpid()}`" + (f", Commit `{_commit}`" if _commit else "") + ")"
+
     lines = [
         "📊 *Wissensspeicher- & RSS-Status:*\n",
+        f"• 🖥️ *Host:* {_env_label}",
         f"• Themen: *{active_cnt} aktiv*, {paused_cnt} pausiert",
         f"• Gesehene Artikel im Cache: *{seen_cnt}*",
         f"• Letzter Notion-Eintrag: *{last_entry}*",
