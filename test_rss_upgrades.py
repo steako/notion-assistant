@@ -276,3 +276,62 @@ def test_feeds_json_schema_valid():
                 assert src.get("query") or src.get("term") or src.get("condition")
             elif stype in ("atproto", "bluesky"):
                 assert src.get("queries") or src.get("query")
+
+
+def test_telegram_split_message_chunks_preserves_html_links():
+    from integrations import telegram_ui
+
+    item_block = (
+        '🔴 <b>#1</b> <a href="https://example.org/study/12345">Sehr langer Studientitel zu Parkinson</a>\n'
+        '   <i>Ausführliche Zusammenfassung der Phase-2-Studie über 52 Wochen mit 240 Patienten und positiven Ergebnissen.</i>\n'
+        '   🔗 <a href="https://example.org/study/12345">Mehr lesen</a>'
+    )
+    long_text = "\n".join([item_block] * 30)
+    chunks = telegram_ui._split_message_chunks(long_text, max_len=1000)
+    assert len(chunks) > 1
+    for ch in chunks:
+        assert len(ch) <= 1000
+        # Jedes geöffnete <a>-Tag muss im selben Chunk auch wieder geschlossen sein
+        assert ch.count("<a ") == ch.count("</a>")
+        assert ch.count("<i>") == ch.count("</i>")
+
+
+def test_notify_sends_full_summary_and_read_more_link(monkeypatch):
+    sent_texts: list[str] = []
+    monkeypatch.setenv("TELEGRAM_RSSBOT_TOKEN", "bot:test")
+    monkeypatch.setenv("TELEGRAM_RSS_CHAT_ID", "12345")
+    monkeypatch.setattr(
+        rss_monitor,
+        "send_telegram_msg",
+        lambda token, chat_id, text, **kw: sent_texts.append(text) or True,
+    )
+
+    long_summary = (
+        "Eine randomisierte Phase-2-Studie mit 180 Teilnehmenden untersuchte den Wirkstoff XY über 24 Wochen. "
+        "Der primäre Endpunkt zeigte eine statistisch signifikante Verbesserung der motorischen Scores im Vergleich zu Placebo. "
+        "Schwerwiegende Nebenwirkungen traten nicht häufiger auf als in der Kontrollgruppe; Phase-3-Planung läuft."
+    )
+    assert len(long_summary) > 180
+
+    results = [
+        {
+            "topic": {"id": "parkinson", "name": "Parkinson", "emoji": "🧠"},
+            "findings": [
+                {
+                    "topic_id": "parkinson",
+                    "topic_name": "Parkinson",
+                    "title": "Phase-2-Erfolg für Wirkstoff XY",
+                    "summary": long_summary,
+                    "relevance": "Hoch",
+                    "key": "wirkstoff-xy-phase2",
+                    "link": "https://pubmed.ncbi.nlm.nih.gov/99999999/",
+                }
+            ],
+            "overview": "",
+        }
+    ]
+    rss_monitor.notify(results, "https://notion.so/digest", {"notify_telegram": True, "notify_windows": False})
+    assert len(sent_texts) == 1
+    msg = sent_texts[0]
+    assert long_summary in msg
+    assert '🔗 <a href="https://pubmed.ncbi.nlm.nih.gov/99999999/">Mehr lesen</a>' in msg

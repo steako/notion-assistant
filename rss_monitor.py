@@ -1287,13 +1287,16 @@ def notify(
             badge = {"Hoch": "🔴", "Mittel": "🟡", "Niedrig": "⚪"}.get(f["relevance"], "•")
             extra = f" ({esc(f['discount'])})" if f.get("discount") else ""
             title_html = esc(f["title"])
-            link = f.get("link") or ""
-            title_part = f'<a href="{esc(link)}">{title_html}</a>' if link else title_html
-            summary_short = esc((f.get("summary") or "")[:180])
+            link = (f.get("link") or "").strip()
+            safe_link = html.escape(link, quote=True) if link else ""
+            title_part = f'<a href="{safe_link}">{title_html}</a>' if safe_link else title_html
+            summary_full = esc((f.get("summary") or "").strip())
             btn_idx += 1
             lines.append(f"{badge} <b>#{btn_idx}</b> {title_part}{extra}")
-            if summary_short:
-                lines.append(f"   <i>{summary_short}</i>")
+            if summary_full:
+                lines.append(f"   <i>{summary_full}</i>")
+            if safe_link:
+                lines.append(f'   🔗 <a href="{safe_link}">Mehr lesen</a>')
 
             if store is not None and btn_idx <= 3:
                 raw_key = f"{f.get('topic_id', '')}|{f.get('key', '')}|{f.get('title', '')}"

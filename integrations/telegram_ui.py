@@ -115,6 +115,29 @@ def _tg_post(token: str, method: str, payload: dict[str, Any], timeout: int = 15
     return {"ok": False}
 
 
+def _split_message_chunks(text: str, max_len: int = 3900) -> list[str]:
+    """Teilt lange Nachrichten möglichst an Absatz-/Zeilengrenzen, damit HTML-Tags nicht zerrissen werden."""
+    if len(text) <= max_len:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= max_len:
+            chunks.append(remaining)
+            break
+        split_at = remaining.rfind("\n\n", 0, max_len)
+        if split_at <= 0:
+            split_at = remaining.rfind("\n", 0, max_len)
+        if split_at <= 0:
+            split_at = remaining.rfind(" ", 0, max_len)
+        if split_at <= 0:
+            split_at = max_len
+        chunks.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip("\n")
+    return [c for c in chunks if c]
+
+
 def send_message(
     token: str,
     chat_id: str | int,
@@ -125,14 +148,14 @@ def send_message(
 ) -> bool:
     """
     Sendet eine Nachricht an Telegram:
-    - Teilt Texte > 3900 Zeichen in Chunks
+    - Teilt Texte > 3900 Zeichen sauber an Zeilengrenzen in Chunks
     - Hängt `reply_markup` an den letzten Chunk
     - Fällt bei HTML-Parse-Fehlern (HTTP 400) automatisch auf Plaintext zurück
     """
     if not token or not chat_id or not text:
         return False
 
-    chunks = [text[i : i + 3900] for i in range(0, len(text), 3900)]
+    chunks = _split_message_chunks(text, max_len=3900)
     all_ok = True
     for idx, chunk in enumerate(chunks):
         is_last = idx == len(chunks) - 1
