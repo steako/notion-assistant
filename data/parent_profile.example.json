@@ -1,0 +1,25 @@
+{
+  "family_context": {
+    "children_summary": "Alter/Phase der Kinder hier über /profil ergänzen (z. B. Kind 1: 8 Jahre, Grundschule)",
+    "focus_areas": [
+      "Umgang mit Stress & elterliche Co-Regulation",
+      "Konflikte ruhig und klar begleiten (ohne Machtkampf)",
+      "ADHS im Alltag (Übergänge, Reizüberflutung, Exekutivfunktionen, Struktur)"
+    ],
+    "working_strategies": [
+      "Erst eigene Anspannung regulieren (kurzer Atem-Reset), dann sprechen",
+      "Kurze, visuelle 1-Schritt-Anweisungen statt langer Erklärungen",
+      "Empathie zeigen, aber Grenze ruhig und unmissverständlich halten"
+    ],
+    "known_triggers": [
+      "Morgendlicher Zeitdruck vor Kita/Schule",
+      "Übergang nach Schule/Arbeit (Mittags-/Nachmittagsloch)",
+      "Abendliches Herunterfahren & Bettgeh-Routine"
+    ]
+  },
+  "coaching_preferences": {
+    "tone": "Warm, entlastend, konkret, neurodiversitäts-sensibel, sofort im Alltag anwendbar",
+    "bridge_to_parent_personality": "Hohe Empathie als Stärke nutzen, aber Harmoniefalle/Nachgeben vermeiden und eigene Reizbelastung früh schützen."
+  },
+  "custom_notes": []
+}

@@ -369,3 +369,68 @@ class NotionClient:
                 "url": obj.get("url", ""),
             })
         return out
+
+    def get_page_summary(self, page_id: str, max_blocks: int = 80) -> dict[str, Any]:
+        """Lädt Titel und Block-Text einer Notion-Seite (z. B. About Stefan oder Ziel-Seite)."""
+        clean_id = (page_id or "").strip()
+        if not clean_id:
+            return {"id": "", "title": "", "text": "", "url": ""}
+        page = self._request("GET", f"/pages/{clean_id}")
+        props = page.get("properties", {})
+        title = ""
+        for pval in props.values():
+            if pval.get("type") == "title":
+                title = "".join(t.get("plain_text", "") for t in pval.get("title", [])).strip()
+                break
+        text = self.get_page_blocks_text(clean_id, max_blocks=max_blocks)
+        return {
+            "id": page.get("id", clean_id),
+            "title": title,
+            "text": text,
+            "url": page.get("url", ""),
+        }
+
+    def query_database_items(self, db_id: str, page_size: int = 20) -> list[dict[str, Any]]:
+        """Liest Titel und kompakte Textfelder aus einer beliebigen Notion-Datenbank (Memories, Ziele, etc.)."""
+        clean_id = (db_id or "").strip()
+        if not clean_id:
+            return []
+        payload = {
+            "page_size": min(max(1, page_size), 50),
+            "sorts": [{"timestamp": "last_edited_time", "direction": "descending"}],
+        }
+        res = self._request("POST", f"/databases/{clean_id}/query", payload)
+        items: list[dict[str, Any]] = []
+        for page in res.get("results", []):
+            props = page.get("properties", {})
+            title = ""
+            details: list[str] = []
+            for pname, pval in props.items():
+                ptype = pval.get("type")
+                if ptype == "title":
+                    title = "".join(t.get("plain_text", "") for t in pval.get("title", [])).strip()
+                elif ptype == "rich_text":
+                    txt = "".join(t.get("plain_text", "") for t in pval.get("rich_text", [])).strip()
+                    if txt:
+                        details.append(f"{pname}: {txt[:200]}")
+                elif ptype == "select":
+                    sel = (pval.get("select") or {}).get("name")
+                    if sel:
+                        details.append(f"{pname}: {sel}")
+                elif ptype == "status":
+                    st = (pval.get("status") or {}).get("name")
+                    if st:
+                        details.append(f"{pname}: {st}")
+                elif ptype == "multi_select":
+                    ms = [m.get("name", "") for m in pval.get("multi_select", []) if m.get("name")]
+                    if ms:
+                        details.append(f"{pname}: {', '.join(ms)}")
+            if title or details:
+                items.append({
+                    "id": page.get("id", ""),
+                    "title": title or "Eintrag",
+                    "details": " | ".join(details),
+                    "url": page.get("url", ""),
+                    "last_edited_time": page.get("last_edited_time", ""),
+                })
+        return items

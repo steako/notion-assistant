@@ -173,6 +173,21 @@ class StateStore:
                         payload_json TEXT NOT NULL,
                         created_at TEXT NOT NULL
                     );
+
+                    CREATE TABLE IF NOT EXISTS coaching_logs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        bot TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        date TEXT NOT NULL,
+                        topic TEXT,
+                        prompt_summary TEXT,
+                        content TEXT NOT NULL,
+                        feedback TEXT,
+                        stress_level INTEGER,
+                        created_at TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_coaching_logs_lookup
+                        ON coaching_logs (bot, date DESC, id DESC);
                     """
                 )
 
@@ -602,6 +617,89 @@ class StateStore:
     def get_task_defer_count(self, task_key: str) -> int:
         counts = self.get_kv("task_defer_counts", {}) or {}
         return int(counts.get(task_key, 0))
+
+    # ------------------------------------------------------------------
+    # Coaching & Parenting Logs (Impulse, Check-ins, Stress, Feedback)
+    # ------------------------------------------------------------------
+
+    def add_coaching_log(
+        self,
+        bot: str,
+        kind: str,
+        content: str,
+        topic: str = "",
+        prompt_summary: str = "",
+        feedback: str = "",
+        stress_level: int | None = None,
+        date_str: str | None = None,
+    ) -> int:
+        now = dt.datetime.now().isoformat(timespec="seconds")
+        d = date_str or dt.date.today().isoformat()
+        with _DB_LOCK:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    """
+                    INSERT INTO coaching_logs
+                    (bot, kind, date, topic, prompt_summary, content, feedback, stress_level, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        bot,
+                        kind,
+                        d,
+                        topic[:160],
+                        prompt_summary[:300],
+                        content[:4000],
+                        feedback[:80],
+                        stress_level,
+                        now,
+                    ),
+                )
+                return int(cur.lastrowid or 0)
+
+    def get_recent_coaching_logs(
+        self,
+        bot: str,
+        days: int = 14,
+        kind: str | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        cutoff = (dt.date.today() - dt.timedelta(days=days)).isoformat()
+        with _DB_LOCK:
+            with self._connect() as conn:
+                if kind:
+                    rows = conn.execute(
+                        """
+                        SELECT * FROM coaching_logs
+                        WHERE bot = ? AND date >= ? AND kind = ?
+                        ORDER BY id DESC LIMIT ?
+                        """,
+                        (bot, cutoff, kind, limit),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        """
+                        SELECT * FROM coaching_logs
+                        WHERE bot = ? AND date >= ?
+                        ORDER BY id DESC LIMIT ?
+                        """,
+                        (bot, cutoff, limit),
+                    ).fetchall()
+        return [dict(r) for r in rows]
+
+    def set_coaching_feedback(self, log_id: int, feedback: str, stress_level: int | None = None) -> None:
+        with _DB_LOCK:
+            with self._connect() as conn:
+                if stress_level is not None:
+                    conn.execute(
+                        "UPDATE coaching_logs SET feedback = ?, stress_level = ? WHERE id = ?",
+                        (feedback[:80], stress_level, log_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE coaching_logs SET feedback = ? WHERE id = ?",
+                        (feedback[:80], log_id),
+                    )
 
     # ------------------------------------------------------------------
     # Legacy JSON Migration

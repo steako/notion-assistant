@@ -97,6 +97,27 @@ Befehle im RSS-Bot:
 
 ---
 
+## 🧭 Persönlicher Coach-Bot (`coach_bot.py`)
+
+Liefert tägliche, psychologisch fundierte Coaching-Impulse und Sparring auf Basis deines **LPP-Persönlichkeitsprofils**, deiner **Ziele** (`/ziele` + Notion), deiner offenen **Notion-Tasks** und deiner **Kalender-Auslastung**:
+- **Token:** `TELEGRAM_COACHBOT_TOKEN` (optional `TELEGRAM_COACH_CHAT_ID`)
+- **Modell-Tiering:** Schnelle Dialoge via `gemini-3.5-flash-lite` (`coach_chat`), tiefe Impulse & Wochen-Reviews via `gemini-4-hydrogen` (`coach_deep`, Fallback `gemini-3.8-flash`).
+- **Befehle:** `/impuls`, `/checkin`, `/ziele`, `/profil`, `/tief <Thema>`, `/review`, `/status`, `/update`
+- **Interaktive Buttons:** `🎯 Task anlegen`, `⏸️ 30m Slot blocken`, `📝 Reflexion sichern`, `👍 Hilfreich`, `🔄 Anderer Fokus`
+- **LPP-Import:** `python coach_bot.py import-lpp <pfad/zur/lpp.zip>` oder LPP-`.zip`/`.docx`/`.pdf` direkt im Coach-Bot-Chat senden (Profil liegt `.gitignore`-geschützt lokal unter `data/coach_profile.json`).
+
+---
+
+## 👨‍👩‍👧‍👦 Elterncoaching-Bot (`parent_bot.py`)
+
+Spezialisierter Eltern-Coach mit Fokus auf **Stressregulation, ruhige Konfliktlösung & ADHS im Alltag**:
+- **Token:** `TELEGRAM_PARENTBOT_TOKEN` (optional `TELEGRAM_PARENT_CHAT_ID`, kommagetrennt auch für Partner-Zugriff)
+- **Datenschutz:** Alle Gespräche, Stresswerte und das Familienprofil (`data/parent_profile.json`) bleiben standardmäßig **rein lokal** in `assistant.db` (Notion-Export nur manuell per Button).
+- **Befehle:** `/akut <Situation>`, `/impuls [morgen|mittag|abend]`, `/checkin`, `/muster`, `/profil`, `/status`, `/update`
+- **Check-in-Buttons:** Stress-Level (`🟢 Ruhig`, `🟡 Angespannt`, `🔴 Überlastet`), `🆘 Akut-Hilfe`, `💾 Strategie merken`, `📌 Als Task nach Notion`
+
+---
+
 ## Wie du unterwegs Sprachnachrichten, Fotos & Texte aufnimmst
 
 ### Weg 1: Telegram Haupt-Bot (Empfohlen – inkl. Buttons, Slots & Multimodalität)
@@ -131,9 +152,11 @@ python assistant.py sync-calendar     # Offene Termine mit Google Kalender abgle
 ```
 
 Integrierter Zeitplan (Europe/Berlin):
+- **07:15, 12:45 & 20:15 Uhr:** Elterncoaching-Bot (Morgen-, Mittags- & Abend-Check-in)
 - **07:30 & 18:30 Uhr:** RSS-Recherche
 - **08:00 & 19:30 Uhr:** Morgen-Briefing & Abend-Checkliste
-- **Sonntags 18:00 & 18:15 Uhr:** Weekly Review & RSS-Wochen-Synthese
+- **08:15 & 20:00 Uhr:** Coach-Bot (Morgen-Impuls & Abend-Check-in)
+- **Sonntags 18:00, 18:15 & 18:30 Uhr:** Weekly Review, RSS-Wochen-Synthese & Coaching-Review
 - **Laufend (alle 5 Min):** Sync, Inbox & Pre-Meeting-Briefing-Pings (40 Min vor privaten Terminen)
 
 ---

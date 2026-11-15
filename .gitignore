@@ -14,9 +14,16 @@
 *.tmp
 local_state.json
 rss_state.json
+coach_state.json
+parent_state.json
 gcal_cache.json
 scheduler_state.json
 work_busy_slots.json
+
+# Lokale Coaching- & Familienprofile (enthalten persönliche Daten!)
+data/*
+!data/.gitkeep
+!data/*.example.json
 
 # Audio- und Notiz-Drops von unterwegs
 inbox_drop/*

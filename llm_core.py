@@ -29,6 +29,7 @@ log = logging.getLogger("llm_core")
 # Standard-Modelle
 MODEL_FLASH_LITE = "gemini-3.5-flash-lite"
 MODEL_FLASH = "gemini-3.8-flash"
+MODEL_HYDROGEN = "gemini-4-hydrogen"
 
 # Task-Zuordnungen
 TASK_CONFIGS: dict[str, dict[str, str]] = {
@@ -37,6 +38,8 @@ TASK_CONFIGS: dict[str, dict[str, str]] = {
     "intent": {"model": MODEL_FLASH_LITE, "thinking_level": "minimal"},
     "chat_simple": {"model": MODEL_FLASH_LITE, "thinking_level": "minimal"},
     "chat_complex": {"model": MODEL_FLASH, "thinking_level": "low"},
+    "coach_chat": {"model": MODEL_FLASH_LITE, "thinking_level": "minimal"},
+    "coach_deep": {"model": MODEL_HYDROGEN, "thinking_level": "low"},
     "default": {"model": MODEL_FLASH_LITE, "thinking_level": "minimal"},
 }
 
@@ -55,8 +58,8 @@ def resolve_task_model(task: str, cfg: dict[str, Any] | None = None) -> tuple[st
     model = task_spec.get("model", MODEL_FLASH_LITE)
     thinking_level = task_spec.get("thinking_level", "minimal")
 
-    # WICHTIGE SICHERHEITSREGEL: 3.8 Flash akzeptiert KEIN "minimal"
-    if "3.8-flash" in model and thinking_level == "minimal":
+    # WICHTIGE SICHERHEITSREGEL: 3.8 Flash und Hydrogen akzeptieren ggf. KEIN "minimal"
+    if ("3.8-flash" in model or "hydrogen" in model) and thinking_level == "minimal":
         thinking_level = "low"
 
     return model, thinking_level
@@ -74,7 +77,7 @@ def build_gemini_config(
 
     # Validiere thinking_level gegen das Ziel-Modell
     clean_level = thinking_level or "minimal"
-    if "3.8-flash" in model and clean_level == "minimal":
+    if ("3.8-flash" in model or "hydrogen" in model) and clean_level == "minimal":
         clean_level = "low"
 
     thinking_config = types.ThinkingConfig(thinking_level=clean_level)
@@ -121,7 +124,7 @@ def execute_gemini_call(
     response_mime_type: str | None = None,
     temperature: float | None = None,
 ) -> Any:
-    """Führt den eigentlichen Call gegen client.models.generate_content aus."""
+    """Führt den eigentlichen Call gegen client.models.generate_content aus (inkl. Hydrogen->3.8-Flash Fallback)."""
     config = build_gemini_config(
         model=model,
         thinking_level=thinking_level,
@@ -129,13 +132,33 @@ def execute_gemini_call(
         response_mime_type=response_mime_type,
         temperature=temperature,
     )
-    resp = client.models.generate_content(
-        model=model,
-        contents=prompt,
-        config=config,
-    )
-    log_gemini_usage(task, model, thinking_level, resp)
-    return resp
+    try:
+        resp = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=config,
+        )
+        log_gemini_usage(task, model, thinking_level, resp)
+        return resp
+    except Exception as exc:
+        if "hydrogen" in str(model).lower():
+            fallback_level = "low" if thinking_level == "minimal" else thinking_level
+            log.warning("Modell %s nicht verfügbar (%s) -> Fallback auf %s.", model, exc, MODEL_FLASH)
+            fb_config = build_gemini_config(
+                model=MODEL_FLASH,
+                thinking_level=fallback_level,
+                system_instruction=system_instruction,
+                response_mime_type=response_mime_type,
+                temperature=temperature,
+            )
+            resp = client.models.generate_content(
+                model=MODEL_FLASH,
+                contents=prompt,
+                config=fb_config,
+            )
+            log_gemini_usage(task, MODEL_FLASH, fallback_level, resp)
+            return resp
+        raise
 
 
 def call_ollama_json_safe(

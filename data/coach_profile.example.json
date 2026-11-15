@@ -1,0 +1,47 @@
+{
+  "name": "Vorname Nachname",
+  "roles": [
+    "Berufliche Rolle / Führung",
+    "Nebenprojekt / Kreativ",
+    "Privat / Familie"
+  ],
+  "lpp_summary": {
+    "report_date": "YYYY-MM-DD",
+    "motives": [
+      "Beispiel-Motiv 1 (sehr hoch)",
+      "Beispiel-Motiv 2 (hoch)"
+    ],
+    "core_strengths": [
+      "Empathie",
+      "Reflexionsvermögen",
+      "Innovationskompetenz"
+    ],
+    "big_five_highlights": [
+      "Hohe Offenheit für Ideen & neue Wege",
+      "Starke Kooperationsorientierung"
+    ],
+    "development_areas": [
+      {
+        "id": "umsetzung_struktur",
+        "title": "Ideen in Umsetzung überführen & Fokus halten",
+        "risks": "Verzettelung bei zu vielen parallelen Themen.",
+        "interventions": [
+          "WIP-Limit setzen",
+          "Konkreten nächsten Schritt innerhalb von 2-4 Wochen definieren"
+        ]
+      }
+    ],
+    "ist_soll_gaps": [
+      "Ordnungsorientierung: IST niedrig vs. SOLL hoch"
+    ]
+  },
+  "coaching_preferences": {
+    "tone": "Wertschätzend, klar, konkret, bildhaft aber mit klarem nächstem Handlungsschritt",
+    "max_impulse_words": 220,
+    "avoid": [
+      "Floskeln ohne Praxisbezug",
+      "Zu abstrakte Theorie ohne Umsetzungsbrücke"
+    ]
+  },
+  "custom_notes": []
+}

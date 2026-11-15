@@ -9,6 +9,9 @@
     "tasks_data_source_id": "1afde2c9-c340-420c-aacc-825ea8791ac3",
     "documents_database_id": "992d2210-6628-493d-90b0-bff21d75e0fa",
     "memories_database_id": "40928f20-9755-81fb-b16d-f5679e2942f3",
+    "about_page_id": "40928f20-9755-8103-b785-dec705ce6ef7",
+    "goals_page_id": "",
+    "goals_database_id": "",
     "knowledge_hub_page_id": "40f28f20-9755-8173-a9fb-c186ba992316",
     "knowledge_database_id": "c7bac0f9-b222-4aa6-a0b4-2510fb987b7b"
   },
@@ -17,14 +20,35 @@
     "model": "gemini-3.5-flash-lite",
     "fast_model": "gemini-3.5-flash-lite",
     "complex_model": "gemini-3.8-flash",
+    "coaching_model": "gemini-4-hydrogen",
     "fallback_provider": "ollama",
     "tiers": {
       "rss_summary": {"model": "gemini-3.5-flash-lite", "thinking_level": "minimal"},
       "extract": {"model": "gemini-3.5-flash-lite", "thinking_level": "minimal"},
       "intent": {"model": "gemini-3.5-flash-lite", "thinking_level": "minimal"},
       "chat_simple": {"model": "gemini-3.5-flash-lite", "thinking_level": "minimal"},
-      "chat_complex": {"model": "gemini-3.8-flash", "thinking_level": "low"}
+      "chat_complex": {"model": "gemini-3.8-flash", "thinking_level": "low"},
+      "coach_chat": {"model": "gemini-3.5-flash-lite", "thinking_level": "minimal"},
+      "coach_deep": {"model": "gemini-4-hydrogen", "thinking_level": "low"}
     }
+  },
+  "schedule": {
+    "enabled": true,
+    "timezone": "Europe/Berlin",
+    "jobs": [
+      {"id": "parent_morning", "time": "07:15", "catchup_until": "11:30"},
+      {"id": "rss_morning", "time": "07:30", "catchup_until": "18:00", "command": ["rss_monitor.py", "run"]},
+      {"id": "briefing_morning", "time": "08:00", "catchup_until": "17:00", "command": ["assistant.py", "briefing", "--mode", "morning", "--telegram"]},
+      {"id": "coach_morning", "time": "08:15", "catchup_until": "16:00"},
+      {"id": "parent_midday", "time": "12:45", "catchup_until": "17:00"},
+      {"id": "rss_evening", "time": "18:30", "catchup_until": "23:59", "command": ["rss_monitor.py", "run"]},
+      {"id": "briefing_evening", "time": "19:30", "catchup_until": "23:59", "command": ["assistant.py", "briefing", "--mode", "evening", "--telegram"]},
+      {"id": "coach_evening", "time": "20:00", "catchup_until": "23:59"},
+      {"id": "parent_evening", "time": "20:15", "catchup_until": "23:59"},
+      {"id": "weekly_review", "day_of_week": 6, "time": "18:00", "catchup_until": "23:59", "command": ["assistant.py", "review"]},
+      {"id": "weekly_synthesis", "day_of_week": 6, "time": "18:15", "catchup_until": "23:59", "command": ["rss_bot.py"]},
+      {"id": "coach_weekly", "day_of_week": 6, "time": "18:30", "catchup_until": "23:59"}
+    ]
   },
   "chat": {
     "max_iterations": 4,

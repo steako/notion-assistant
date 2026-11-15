@@ -297,3 +297,26 @@ RSS_BOT_COMMANDS: list[tuple[str, str]] = [
     ("status", "RSS- & Feed-Health-Status"),
     ("help", "Befehlsübersicht"),
 ]
+
+COACH_BOT_COMMANDS: list[tuple[str, str]] = [
+    ("impuls", "Heutigen Coaching-Impuls (Hydrogen) abrufen"),
+    ("checkin", "Abend-Reflexion & Check-in starten"),
+    ("ziele", "Ziele anzeigen & verwalten (/ziele add ...)"),
+    ("profil", "LPP-Profil & Coaching-Fokus ansehen/ergänzen"),
+    ("review", "Wöchentliches Coaching-Review"),
+    ("tief", "Tiefes Coaching-Sparring zu einem Thema"),
+    ("status", "Coach-Status, Profil & nächste Impulse"),
+    ("update", "Code aktualisieren & Bot neu starten"),
+    ("help", "Hilfe & Befehlsübersicht"),
+]
+
+PARENT_BOT_COMMANDS: list[tuple[str, str]] = [
+    ("akut", "Soforthilfe bei Konflikt, Stress oder ADHS-Situation"),
+    ("impuls", "Aktuellen Eltern-Impuls abrufen (morgen/mittag/abend)"),
+    ("checkin", "Stress- & Tages-Check-in starten"),
+    ("muster", "Wöchentliche Muster & Strategien auswerten"),
+    ("profil", "Familien- & ADHS-Kontext ansehen/ergänzen"),
+    ("status", "Elterncoach-Status & Check-in-Zeiten"),
+    ("update", "Code aktualisieren & Bot neu starten"),
+    ("help", "Hilfe & Befehlsübersicht"),
+]

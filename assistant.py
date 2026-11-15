@@ -1885,12 +1885,18 @@ def process_telegram_updates(
                 sched_cfg = {**DEFAULT_SCHEDULE, **(cfg.get("schedule") or {})}
                 job_lines = []
                 job_names = {
+                    "parent_morning": "🌅 Elterncoach Morgen",
                     "rss_morning": "📰 RSS-Monitor Morgen",
                     "briefing_morning": "☀️ Morgen-Briefing",
+                    "coach_morning": "🧭 Coach-Bot Morgen-Impuls",
+                    "parent_midday": "🌤️ Elterncoach Mittag",
                     "rss_evening": "📰 RSS-Monitor Abend",
                     "briefing_evening": "🌙 Abend-Briefing",
+                    "coach_evening": "🌙 Coach-Bot Abend-Check-in",
+                    "parent_evening": "🌙 Elterncoach Abend",
                     "weekly_review": "🗓️ Wochen-Review (So)",
                     "weekly_synthesis": "🧠 RSS-Synthese (So)",
+                    "coach_weekly": "🧭 Coaching-Review (So)",
                 }
                 for j in sched_cfg.get("jobs", []):
                     jid = j.get("id", "")
@@ -3215,16 +3221,22 @@ DEFAULT_SCHEDULE: dict[str, Any] = {
     "enabled": True,
     "timezone": "Europe/Berlin",
     "jobs": [
+        {"id": "parent_morning", "time": "07:15", "catchup_until": "11:30"},
         {"id": "rss_morning", "time": "07:30", "catchup_until": "18:00", "command": ["rss_monitor.py", "run"]},
         {"id": "briefing_morning", "time": "08:00", "catchup_until": "17:00",
          "command": ["assistant.py", "briefing", "--mode", "morning", "--telegram"]},
+        {"id": "coach_morning", "time": "08:15", "catchup_until": "16:00"},
+        {"id": "parent_midday", "time": "12:45", "catchup_until": "17:00"},
         {"id": "rss_evening", "time": "18:30", "catchup_until": "23:59", "command": ["rss_monitor.py", "run"]},
         {"id": "briefing_evening", "time": "19:30", "catchup_until": "23:59",
          "command": ["assistant.py", "briefing", "--mode", "evening", "--telegram"]},
+        {"id": "coach_evening", "time": "20:00", "catchup_until": "23:59"},
+        {"id": "parent_evening", "time": "20:15", "catchup_until": "23:59"},
         {"id": "weekly_review", "day_of_week": 6, "time": "18:00", "catchup_until": "23:59",
          "command": ["assistant.py", "review"]},
         {"id": "weekly_synthesis", "day_of_week": 6, "time": "18:15", "catchup_until": "23:59",
          "command": ["rss_bot.py"]},
+        {"id": "coach_weekly", "day_of_week": 6, "time": "18:30", "catchup_until": "23:59"},
     ],
 }
 
@@ -3413,8 +3425,79 @@ def run_scheduled_jobs(
             running[job_id] = t
             continue
 
+        # D2) Coach-Bot Jobs (Morgen-Impuls, Abend-Check-in, Sonntags-Coaching-Review)
+        if job_id.startswith("coach_"):
+            coach_token = os.environ.get("TELEGRAM_COACHBOT_TOKEN", "").strip()
+            if not coach_token:
+                continue
+
+            def _coach_worker(jid=job_id, d=today, ctok=coach_token):
+                try:
+                    print(f"[Scheduler] Starte Coach-Bot-Job '{jid}'...")
+                    import coach_bot
+                    if jid == "coach_morning":
+                        ok, err_info = coach_bot.send_daily_impulse(cfg=cfg, token=ctok)
+                    elif jid == "coach_evening":
+                        ok, err_info = coach_bot.send_evening_checkin(cfg=cfg, token=ctok)
+                    elif jid == "coach_weekly":
+                        cid = coach_bot.resolve_target_chat_id(coach_bot.load_coach_state())
+                        if not cid:
+                            raise RuntimeError("Coach-Bot Chat-ID fehlt.")
+                        html_out, _ = coach_bot.generate_weekly_coaching_review(cfg, coach_bot.get_store(), notion)
+                        ok = coach_bot.send_message(ctok, cid, html_out)
+                        err_info = "Telegram send_message fehlgeschlagen"
+                    else:
+                        ok, err_info = False, f"Unbekannter Coach-Job: {jid}"
+
+                    if not ok:
+                        raise RuntimeError(err_info)
+                    st = _load_scheduler_state()
+                    st[jid] = d
+                    _save_scheduler_state(st)
+                    SCHEDULER_RETRY_COOLDOWN.pop(jid, None)
+                    print(f"[Scheduler] Coach-Bot-Job '{jid}' erfolgreich abgeschlossen.")
+                except Exception as exc:
+                    SCHEDULER_RETRY_COOLDOWN[jid] = time.time() + 300
+                    print(f"[Scheduler Fehler] Coach-Job '{jid}' fehlgeschlagen (erneuter Versuch in 5 Min.): {exc}")
+
+            t = threading.Thread(target=_coach_worker, daemon=True)
+            t.start()
+            running[job_id] = t
+            continue
+
+        # D3) Elterncoaching-Bot Jobs (Morgen, Mittag, Abend)
+        if job_id.startswith("parent_"):
+            parent_token = os.environ.get("TELEGRAM_PARENTBOT_TOKEN", "").strip()
+            if not parent_token:
+                continue
+            phase = "midday" if "midday" in job_id else ("evening" if "evening" in job_id else "morning")
+
+            def _parent_worker(jid=job_id, ph=phase, d=today, ptok=parent_token):
+                try:
+                    print(f"[Scheduler] Starte Elterncoach-Job '{jid}' (Phase: {ph})...")
+                    import parent_bot
+                    ok, err_info = parent_bot.send_parent_checkin(phase=ph, cfg=cfg, token=ptok)
+                    if not ok:
+                        raise RuntimeError(err_info)
+                    st = _load_scheduler_state()
+                    st[jid] = d
+                    _save_scheduler_state(st)
+                    SCHEDULER_RETRY_COOLDOWN.pop(jid, None)
+                    print(f"[Scheduler] Elterncoach-Job '{jid}' erfolgreich abgeschlossen.")
+                except Exception as exc:
+                    SCHEDULER_RETRY_COOLDOWN[jid] = time.time() + 300
+                    print(f"[Scheduler Fehler] Elterncoach-Job '{jid}' fehlgeschlagen (erneuter Versuch in 5 Min.): {exc}")
+
+            t = threading.Thread(target=_parent_worker, daemon=True)
+            t.start()
+            running[job_id] = t
+            continue
+
         # E) Generischer Fallback für sonstige externe Befehle als Subprozess
-        cmd = [sys.executable] + [str(BASE_DIR / job["command"][0])] + list(job["command"][1:])
+        cmd_spec = job.get("command") or []
+        if not cmd_spec:
+            continue
+        cmd = [sys.executable] + [str(BASE_DIR / cmd_spec[0])] + list(cmd_spec[1:])
         try:
             log_fh = open(SCHEDULER_LOG_PATH, "a", encoding="utf-8")
             log_fh.write(f"\n===== {now.isoformat(timespec='seconds')} Start '{job_id}': {' '.join(cmd)} =====\n")
@@ -3493,6 +3576,24 @@ def run_daemon(
             print("[Daemon] Dedizierter RSS-Bot erfolgreich im Hintergrund gestartet.")
         except Exception as _e:
             print(f"[Daemon] Hinweis: Konnte RSS-Bot nicht starten: {_e}")
+
+    # Dedizierten Coach-Bot starten, falls konfiguriert
+    if os.environ.get("TELEGRAM_COACHBOT_TOKEN", "").strip():
+        try:
+            import coach_bot
+            coach_bot.start_in_background()
+            print("[Daemon] Dedizierter Coach-Bot erfolgreich im Hintergrund gestartet.")
+        except Exception as _e:
+            print(f"[Daemon] Hinweis: Konnte Coach-Bot nicht starten: {_e}")
+
+    # Dedizierten Elterncoaching-Bot starten, falls konfiguriert
+    if os.environ.get("TELEGRAM_PARENTBOT_TOKEN", "").strip():
+        try:
+            import parent_bot
+            parent_bot.start_in_background()
+            print("[Daemon] Dedizierter Elterncoaching-Bot erfolgreich im Hintergrund gestartet.")
+        except Exception as _e:
+            print(f"[Daemon] Hinweis: Konnte Elterncoaching-Bot nicht starten: {_e}")
 
     last_full_sync = 0.0
     scheduled_procs: dict[str, Any] = {}
