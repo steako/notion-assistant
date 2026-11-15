@@ -265,10 +265,13 @@ def filter_and_preprocess_feed_item(
 def cap_candidates(
     candidates: list[dict[str, Any]],
     max_total: int = 60,
+    diversify_by_source: bool = False,
 ) -> list[dict[str, Any]]:
     """
     Begrenzt Kandidaten deterministisch auf die neuesten Einträge.
     Undatierte Einträge werden stabil am Ende eingeordnet.
+    Bei diversify_by_source=True wird per Round-Robin über die Quellen ausgewählt,
+    damit volumenstarke Social-/News-Feeds keine Fachquellen verdrängen.
     """
     if len(candidates) <= max_total:
         return candidates
@@ -279,5 +282,33 @@ def cap_candidates(
             return (1, pub)
         return (0, dt.datetime.min.replace(tzinfo=dt.timezone.utc))
 
-    sorted_candidates = sorted(candidates, key=sort_key, reverse=True)
-    return sorted_candidates[:max_total]
+    if not diversify_by_source:
+        sorted_candidates = sorted(candidates, key=sort_key, reverse=True)
+        return sorted_candidates[:max_total]
+
+    # Gruppieren nach Basis-Quelle (_source_name oder source) und je Gruppe absteigend sortieren
+    buckets: dict[str, list[dict[str, Any]]] = {}
+    for it in candidates:
+        src = str(it.get("_source_name") or it.get("source") or "unknown")
+        buckets.setdefault(src, []).append(it)
+    for src in buckets:
+        buckets[src].sort(key=sort_key, reverse=True)
+
+    # Round-Robin: pro Runde von jeder Quelle den jeweils nächsten neuesten Kandidaten nehmen
+    selected: list[dict[str, Any]] = []
+    source_keys = list(buckets.keys())
+    idx = 0
+    while len(selected) < max_total:
+        added_in_round = False
+        for src in source_keys:
+            grp = buckets[src]
+            if idx < len(grp):
+                selected.append(grp[idx])
+                added_in_round = True
+                if len(selected) >= max_total:
+                    break
+        if not added_in_round:
+            break
+        idx += 1
+
+    return selected

@@ -202,11 +202,16 @@ _feed_cache: dict[str, list[dict[str, Any]]] = {}
 
 def _http_get_bytes(url: str, timeout: int = 30) -> bytes:
     """Ruft eine URL über requests oder das native urllib.request ab."""
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
+        "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
     if requests is not None:
-        resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=timeout)
+        resp = requests.get(url, headers=headers, timeout=timeout)
         resp.raise_for_status()
         return resp.content
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()
 
@@ -274,6 +279,26 @@ def _parse_feed(content: bytes) -> Any:
     return _Feed(entries)
 
 
+def _matches_source_filters(item: dict[str, Any], source: dict[str, Any]) -> bool:
+    """Prüft optionale Positiv- (`keywords`) und Negativ-Filter (`exclude_keywords`) auf Titel+Summary."""
+    keywords = [str(k).strip().lower() for k in source.get("keywords", []) if str(k).strip()]
+    excludes = [str(k).strip().lower() for k in source.get("exclude_keywords", []) if str(k).strip()]
+    if not keywords and not excludes:
+        return True
+    hay = f"{item.get('title', '')} {item.get('summary', '')}".lower()
+
+    def _has_term(term: str) -> bool:
+        if len(term) <= 4 and term.isalnum():
+            return bool(re.search(rf"(?<!\w){re.escape(term)}(?!\w)", hay))
+        return term in hay
+
+    if keywords and not any(_has_term(k) for k in keywords):
+        return False
+    if excludes and any(_has_term(ex) for ex in excludes):
+        return False
+    return True
+
+
 def fetch_rss(source: dict[str, Any], max_age_days: int, max_items: int) -> list[dict[str, Any]]:
     url = source["url"]
     if url not in _feed_cache:
@@ -300,15 +325,12 @@ def fetch_rss(source: dict[str, Any], max_age_days: int, max_items: int) -> list
         _feed_cache[url] = entries
 
     cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=max_age_days)
-    keywords = [k.lower() for k in source.get("keywords", [])]
     out = []
     for e in _feed_cache[url]:
         if e["published"] and e["published"] < cutoff:
             continue
-        if keywords:
-            hay = (e["title"] + " " + e["summary"]).lower()
-            if not any(k in hay for k in keywords):
-                continue
+        if not _matches_source_filters(e, source):
+            continue
         out.append(dict(e, source=source["name"] + (f" / {e['publisher']}" if e.get("publisher") else "")))
         if len(out) >= max_items:
             break
@@ -342,6 +364,213 @@ def fetch_europepmc(source: dict[str, Any], max_age_days: int, max_items: int) -
             "published": published,
             "source": f"{source['name']} / {journal}",
         })
+    return out
+
+
+_MONTH_MAP = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def _parse_pubmed_date_elem(el: Any) -> dt.datetime | None:
+    if el is None:
+        return None
+    y_raw = (el.findtext("Year") or "").strip()
+    if not y_raw.isdigit():
+        return None
+    m_raw = (el.findtext("Month") or "1").strip()
+    if m_raw.isdigit():
+        month = max(1, min(12, int(m_raw)))
+    else:
+        month = _MONTH_MAP.get(m_raw[:3].lower(), 1)
+    d_raw = (el.findtext("Day") or "1").strip()
+    day = max(1, min(28 if month == 2 else 30, int(d_raw))) if d_raw.isdigit() else 1
+    try:
+        return dt.datetime(int(y_raw), month, day, tzinfo=dt.timezone.utc)
+    except ValueError:
+        return dt.datetime(int(y_raw), month, 1, tzinfo=dt.timezone.utc)
+
+
+def fetch_pubmed(source: dict[str, Any], max_age_days: int, max_items: int) -> list[dict[str, Any]]:
+    """Ruft aktuelle Publikationen über NCBI PubMed E-Utilities (esearch + efetch) ab."""
+    import xml.etree.ElementTree as ET
+
+    term = str(source.get("query") or source.get("term") or "").strip()
+    if not term:
+        return []
+
+    search_resp = requests.get(
+        "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+        params={
+            "db": "pubmed",
+            "term": term,
+            "retmax": max_items,
+            "sort": "pub+date",
+            "reldate": max_age_days,
+            "datetype": "edat",
+            "retmode": "json",
+        },
+        headers={"User-Agent": USER_AGENT},
+        timeout=30,
+    )
+    search_resp.raise_for_status()
+    idlist = search_resp.json().get("esearchresult", {}).get("idlist", [])
+    if not idlist:
+        return []
+
+    fetch_resp = requests.get(
+        "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi",
+        params={"db": "pubmed", "id": ",".join(idlist[:max_items]), "retmode": "xml"},
+        headers={"User-Agent": USER_AGENT},
+        timeout=35,
+    )
+    fetch_resp.raise_for_status()
+    root = ET.fromstring(fetch_resp.content)
+
+    out: list[dict[str, Any]] = []
+    for art in root.findall(".//PubmedArticle"):
+        pmid = (art.findtext(".//MedlineCitation/PMID") or "").strip()
+        title_el = art.find(".//Article/ArticleTitle")
+        title = strip_html("".join(title_el.itertext()) if title_el is not None else "").strip()
+        if not title:
+            continue
+
+        abs_parts: list[str] = []
+        for ab in art.findall(".//Article/Abstract/AbstractText"):
+            txt = strip_html("".join(ab.itertext())).strip()
+            if not txt:
+                continue
+            label = (ab.get("Label") or "").strip()
+            abs_parts.append(f"{label}: {txt}" if label else txt)
+        abstract_text = " ".join(abs_parts)
+
+        journal = (
+            (art.findtext(".//Article/Journal/ISOAbbreviation") or "").strip()
+            or (art.findtext(".//Article/Journal/Title") or "").strip()
+            or "PubMed"
+        )
+        pub_types = [
+            pt.text.strip()
+            for pt in art.findall(".//Article/PublicationTypeList/PublicationType")
+            if pt.text and pt.text.strip()
+        ][:3]
+
+        doi = ""
+        for aid in art.findall(".//PubmedData/ArticleIdList/ArticleId"):
+            if (aid.get("IdType") or "").lower() == "doi" and aid.text:
+                doi = aid.text.strip()
+                break
+        link = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else (f"https://doi.org/{doi}" if doi else "")
+
+        published = None
+        for status in ("entrez", "pubmed", "epublish"):
+            pd_el = art.find(f".//PubmedData/History/PubMedPubDate[@PubStatus='{status}']")
+            published = _parse_pubmed_date_elem(pd_el)
+            if published is not None:
+                break
+        if published is None:
+            published = _parse_pubmed_date_elem(art.find(".//Article/Journal/JournalIssue/PubDate"))
+
+        meta = f"[{journal}" + (f"; {', '.join(pub_types)}" if pub_types else "") + "]"
+        out.append({
+            "title": title,
+            "link": link,
+            "summary": f"{meta} {abstract_text}"[:1200],
+            "published": published,
+            "source": f"{source['name']} / {journal}",
+        })
+    return out
+
+
+def fetch_clinicaltrials(source: dict[str, Any], max_age_days: int, max_items: int) -> list[dict[str, Any]]:
+    """Ruft kürzlich aktualisierte klinische Studien von ClinicalTrials.gov (API v2) ab."""
+    today = dt.date.today()
+    start = today - dt.timedelta(days=max_age_days)
+    cond = str(source.get("query") or source.get("condition") or "").strip()
+    if not cond:
+        return []
+
+    date_expr = f"AREA[LastUpdatePostDate]RANGE[{start.isoformat()},MAX]"
+    extra_term = str(source.get("term") or "").strip()
+    term_expr = f"({extra_term}) AND {date_expr}" if extra_term else date_expr
+
+    allowed_phases = {str(p).upper() for p in source.get("phases", []) if str(p).strip()}
+    interventional_only = bool(source.get("interventional_only", False))
+    fetch_size = min(100, max_items * 2 if (allowed_phases or interventional_only) else max_items)
+
+    params: dict[str, Any] = {
+        "query.cond": cond,
+        "query.term": term_expr,
+        "sort": "LastUpdatePostDate:desc",
+        "pageSize": fetch_size,
+        "format": "json",
+    }
+    status_filter = source.get("status_filter", "RECRUITING,ACTIVE_NOT_RECRUITING,ENROLLING_BY_INVITATION,COMPLETED")
+    if status_filter:
+        params["filter.overallStatus"] = status_filter
+
+    resp = requests.get(
+        "https://clinicaltrials.gov/api/v2/studies",
+        params=params,
+        headers={"User-Agent": USER_AGENT},
+        timeout=30,
+    )
+    resp.raise_for_status()
+
+    out: list[dict[str, Any]] = []
+    for st in resp.json().get("studies", []):
+        ps = st.get("protocolSection", {})
+        idm = ps.get("identificationModule", {})
+        stm = ps.get("statusModule", {})
+        dm = ps.get("designModule", {})
+        spm = ps.get("sponsorCollaboratorsModule", {})
+        armm = ps.get("armsInterventionsModule", {})
+        descm = ps.get("descriptionModule", {})
+
+        study_type = str(dm.get("studyType") or "")
+        if interventional_only and study_type != "INTERVENTIONAL":
+            continue
+        phases = [str(p) for p in (dm.get("phases") or []) if p]
+        if allowed_phases and not any(p.upper() in allowed_phases for p in phases):
+            continue
+
+        nct_id = str(idm.get("nctId") or "").strip()
+        title = strip_html(idm.get("briefTitle") or idm.get("officialTitle") or nct_id).strip()
+        if not title:
+            continue
+
+        date_str = str((stm.get("lastUpdatePostDateStruct") or {}).get("date") or "").strip()
+        published = None
+        if date_str:
+            parts = date_str.split("-")
+            try:
+                if len(parts) == 3:
+                    published = dt.datetime.fromisoformat(date_str).replace(tzinfo=dt.timezone.utc)
+                elif len(parts) == 2:
+                    published = dt.datetime(int(parts[0]), int(parts[1]), 1, tzinfo=dt.timezone.utc)
+            except Exception:
+                pass
+
+        sponsor = str((spm.get("leadSponsor") or {}).get("name") or "").strip()
+        status = str(stm.get("overallStatus") or "").strip()
+        enrollment = (dm.get("enrollmentInfo") or {}).get("count")
+        interventions = [i.get("name") for i in (armm.get("interventions") or [])[:4] if i.get("name")]
+
+        meta_parts = [p for p in (nct_id, study_type, "/".join(phases) if phases else "", status, f"n={enrollment}" if enrollment else "") if p]
+        iv_txt = f" Interventionen: {', '.join(interventions)}." if interventions else ""
+        brief_sum = strip_html(descm.get("briefSummary") or "")
+        summary = f"[{' | '.join(meta_parts)}]{iv_txt} {brief_sum}"[:1200]
+
+        out.append({
+            "title": title,
+            "link": f"https://clinicaltrials.gov/study/{nct_id}" if nct_id else "",
+            "summary": summary,
+            "published": published,
+            "source": f"{source['name']} / {sponsor}" if sponsor else source["name"],
+        })
+        if len(out) >= max_items:
+            break
     return out
 
 
@@ -466,6 +695,10 @@ def collect_candidates(
             stype = source.get("type", "rss").lower()
             if stype == "europepmc":
                 items = fetch_europepmc(source, max_age, max_items)
+            elif stype == "pubmed":
+                items = fetch_pubmed(source, max_age, max_items)
+            elif stype == "clinicaltrials":
+                items = fetch_clinicaltrials(source, max_age, max_items)
             elif stype in ("atproto", "bluesky"):
                 items = fetch_atproto(source, max_age, max_items)
             else:
@@ -483,6 +716,8 @@ def collect_candidates(
             continue
         fresh = 0
         for it in items:
+            if not _matches_source_filters(it, source):
+                continue
             clean_it = preprocess.filter_and_preprocess_feed_item(
                 it,
                 cutoff=cutoff,
@@ -497,12 +732,15 @@ def collect_candidates(
             run_fps.update(fps)
             clean_it["fingerprints"] = fps
             clean_it["source"] = it.get("source") or source.get("name")
+            clean_it["_source_name"] = src_name
+            if source.get("skip_jev"):
+                clean_it["skip_jev"] = True
             candidates.append(clean_it)
             fresh += 1
         log.info("[%s] %-45s %3d Einträge, %3d neu", topic["id"], src_name[:45], len(items), fresh)
 
-    # Schutz vor Batch-Spitzen: Begrenze auf die neuesten N Kandidaten pro Thema
-    capped = preprocess.cap_candidates(candidates, max_total=max_topic_candidates)
+    # Schutz vor Batch-Spitzen: Begrenze mit Quellen-Diversifizierung (Round-Robin über Quellen)
+    capped = preprocess.cap_candidates(candidates, max_total=max_topic_candidates, diversify_by_source=True)
     if len(capped) < len(candidates):
         log.info("[%s] Kandidaten durch Cap von %d auf %d begrenzt.", topic["id"], len(candidates), len(capped))
     return capped, errors
@@ -620,11 +858,12 @@ def llm_json(prompt: str, system: str, cfg: dict[str, Any]) -> dict[str, Any]:
 
 
 SYSTEM_PROMPT = (
-    "Du bist ein sorgfältiger, skeptischer Fachredakteur, der für Stefan Kollmeier einen "
-    "persönlichen Wissensspeicher pflegt. Du bewertest neue Meldungen streng nach Relevanz, "
-    "Evidenzqualität und Neuheit gegenüber dem bereits bekannten Wissen. Du erfindest nichts: "
-    "Alle Angaben stammen ausschließlich aus den gelieferten Kandidaten. Schreibe auf Deutsch. "
-    "Antworte AUSSCHLIESSLICH mit einem validen JSON-Objekt."
+    "Du bist ein sorgfältiger Fachredakteur, der für Stefan Kollmeier einen "
+    "persönlichen Wissensspeicher pflegt. Du bewertest neue Meldungen nach Relevanz, "
+    "Evidenzqualität und Neuheit gegenüber dem bereits bekannten Wissen – vermeide Clickbait, "
+    "filtere aber auch solide, praxis- oder forschungsrelevante Fortschritte und Angebote nicht zu streng aus. "
+    "Du erfindest nichts: Alle Angaben stammen ausschließlich aus den gelieferten Kandidaten. "
+    "Schreibe auf Deutsch. Antworte AUSSCHLIESSLICH mit einem validen JSON-Objekt."
 )
 
 
@@ -666,13 +905,12 @@ NEUE KANDIDATEN:
 {chr(10).join(cand_lines)}
 
 AUFGABE:
-1. Wähle nur Kandidaten, die klar zum Fokus passen und substanziell sind.
+1. Wähle alle Kandidaten aus, die zum Fokus passen und einen echten Informations- oder Nutzwert bieten (inklusive solider Preprints, klinischer Studien-Updates, relevanter Versorgungspolitik und nützlicher Gratis-/Rabattaktionen).
 2. Fasse Kandidaten, die über dieselbe Nachricht/Studie/Aktion berichten, zu EINEM Fund zusammen (alle IDs angeben).
 3. Prüfe jeden Fund gegen das bekannte Wissen. Melde ihn nur, wenn er inhaltlich neu ist. Eine echte
    Weiterentwicklung eines bekannten Eintrags (z. B. neue Studienphase, Ergebnisse, Zulassung, Verlängerung/Änderung
    eines Angebots) darf gemeldet werden – dann 'update_of' auf dessen Schlüssel setzen und im Text sagen, was neu ist.
-4. relevance: "Hoch" = bedeutsam/praxisrelevant/großer Fortschritt bzw. sehr attraktives Angebot; "Mittel" = solide und
-   interessant; "Niedrig" = nur am Rande relevant.
+4. relevance: "Hoch" = bedeutsam/praxisrelevant/großer Fortschritt bzw. sehr attraktives Angebot; "Mittel" = solide, verlässliche und thematisch passende Neuerung/Studie/Aktion (im Zweifel eher als "Mittel" aufnehmen als stillschweigend verwerfen); "Niedrig" = nur am Rande relevant.
 5. key: kurzer, eindeutiger, sprechender Schlüssel in Kleinbuchstaben mit Bindestrichen (z. B. "tavapadon-fda-zulassung").
 
 Antworte als JSON:
@@ -710,7 +948,7 @@ def jev_prefilter_candidates(
     - Bei Jev-Fehler: Fallback gemäß JEV_FAILURE_MODE ('gemini' | 'abort')
     """
     client = jev_client.JevClient()
-    stats = {"in": len(candidates), "passed": 0, "dropped": 0, "errors": 0}
+    stats = {"in": len(candidates), "passed": 0, "dropped": 0, "errors": 0, "bypassed": 0}
 
     # Falls Jev nicht konfiguriert oder deaktiviert ist: alle an Gemini durchreichen
     if not client.is_configured or not settings.get("jev_enabled", True):
@@ -719,9 +957,9 @@ def jev_prefilter_candidates(
         return candidates, [], stats
 
     try:
-        threshold = float(os.environ.get("JEV_RELEVANCE_THRESHOLD", settings.get("jev_relevance_threshold", 0.7)))
+        threshold = float(os.environ.get("JEV_RELEVANCE_THRESHOLD", settings.get("jev_relevance_threshold", 0.55)))
     except (ValueError, TypeError):
-        threshold = 0.7
+        threshold = 0.55
 
     try:
         min_cat_conf = float(os.environ.get("JEV_CATEGORY_MIN_CONFIDENCE", settings.get("jev_category_min_confidence", 0.4)))
@@ -739,9 +977,16 @@ def jev_prefilter_candidates(
     if "Sonstiges" not in options:
         options["Sonstiges"] = "Keine der spezifischen Kategorien"
 
-    focus_desc = topic.get("focus", "")[:300]
+    focus_desc = topic.get("focus", "")[:1500]
 
     for item in candidates:
+        if item.get("skip_jev"):
+            item["jev_bypassed"] = True
+            passed.append(item)
+            stats["passed"] += 1
+            stats["bypassed"] += 1
+            continue
+
         state_text = f"Titel: {item.get('title', '')}\nQuelle: {item.get('source', '')}\nText: {item.get('summary', '')[:600]}"
         questions = {
             "is_relevant": {
@@ -793,8 +1038,8 @@ def jev_prefilter_candidates(
             stats["passed"] += 1
 
     log.info(
-        "jev_filter topic=%s in=%d passed=%d dropped=%d errors=%d threshold=%.2f model=%s",
-        topic["id"], stats["in"], stats["passed"], stats["dropped"], stats["errors"], threshold, client.model,
+        "jev_filter topic=%s in=%d passed=%d bypassed=%d dropped=%d errors=%d threshold=%.2f model=%s",
+        topic["id"], stats["in"], stats["passed"], stats["bypassed"], stats["dropped"], stats["errors"], threshold, client.model,
     )
     return passed, dropped, stats
 
@@ -1588,7 +1833,7 @@ def cmd_topic_add_source(args: argparse.Namespace) -> bool:
     stype = getattr(args, "type", "rss").strip().lower()
     keywords = [k.strip() for k in (getattr(args, "keywords", None) or []) if k.strip()]
     src_obj: dict[str, Any] = {"type": stype, "name": name}
-    if stype == "europepmc":
+    if stype in ("europepmc", "pubmed", "clinicaltrials"):
         src_obj["query"] = url
     elif stype in ("atproto", "bluesky"):
         src_obj["queries"] = [q.strip() for q in url.split(",") if q.strip()]
@@ -1634,20 +1879,28 @@ def cmd_topics() -> None:
 
 def cmd_test_feeds() -> None:
     feeds_cfg = load_feeds_config()
+    settings = feeds_cfg.get("settings", {})
+    max_age = int(settings.get("max_age_days", 10))
+    max_items = int(settings.get("max_items_per_source", 30))
     for t in feeds_cfg["topics"]:
-        print(f"{t.get('emoji', '')} {t['name']}")
+        print(f"{t.get('emoji', '')} {t['name']}", flush=True)
         for s in t.get("sources", []):
             try:
                 stype = s.get("type", "rss").lower()
                 if stype == "europepmc":
-                    items = fetch_europepmc(s, 10, 25)
+                    items = fetch_europepmc(s, max_age, max_items)
+                elif stype == "pubmed":
+                    items = fetch_pubmed(s, max_age, max_items)
+                elif stype == "clinicaltrials":
+                    items = fetch_clinicaltrials(s, max_age, max_items)
                 elif stype in ("atproto", "bluesky"):
-                    items = fetch_atproto(s, 10, 25)
+                    items = fetch_atproto(s, max_age, max_items)
                 else:
-                    items = fetch_rss(s, 10, 25)
-                print(f"   OK   {len(items):3d}  {s['name']}")
+                    items = fetch_rss(s, max_age, max_items)
+                items = [it for it in items if _matches_source_filters(it, s)]
+                print(f"   OK   {len(items):3d}  {s['name']}", flush=True)
             except Exception as exc:
-                print(f"   FEHLER     {s['name']}: {exc}")
+                print(f"   FEHLER     {s['name']}: {exc}", flush=True)
 
 
 def main() -> None:
@@ -1699,9 +1952,9 @@ def main() -> None:
 
     p_t_add_src = sub_topic.add_parser("add-source", help="Feed-Quelle zu einem Thema hinzufügen")
     p_t_add_src.add_argument("topic_id", help="Themen-ID")
-    p_t_add_src.add_argument("--url", required=True, help="RSS-URL oder Europe-PMC-Query")
+    p_t_add_src.add_argument("--url", required=True, help="RSS-URL oder Europe-PMC-/PubMed-/ClinicalTrials-Query")
     p_t_add_src.add_argument("--name", help="Name der Quelle (z. B. 'FAZ Wissen')")
-    p_t_add_src.add_argument("--type", choices=["rss", "europepmc", "atproto", "bluesky"], default="rss", help="Quellen-Typ")
+    p_t_add_src.add_argument("--type", choices=["rss", "europepmc", "pubmed", "clinicaltrials", "atproto", "bluesky"], default="rss", help="Quellen-Typ")
     p_t_add_src.add_argument("--keywords", nargs="+", help="Optionale Keyword-Filter")
 
     p_t_rem_src = sub_topic.add_parser("remove-source", help="Quelle aus Thema entfernen")
