@@ -328,10 +328,17 @@ def test_notify_sends_full_summary_and_read_more_link(monkeypatch):
                 }
             ],
             "overview": "",
-        }
+        },
+        {
+            "topic": {"id": "edu_deals", "name": "Rabatte Studierende/Dozierende", "emoji": "🎓"},
+            "findings": [],
+            "overview": "",
+        },
     ]
     rss_monitor.notify(results, "https://notion.so/digest", {"notify_telegram": True, "notify_windows": False})
     assert len(sent_texts) == 1
     msg = sent_texts[0]
     assert long_summary in msg
     assert '🔗 <a href="https://pubmed.ncbi.nlm.nih.gov/99999999/">Mehr lesen</a>' in msg
+    assert "Rabatte Studierende/Dozierende" in msg
+    assert "keine neuen Funde in diesem Lauf" in msg

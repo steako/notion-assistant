@@ -650,7 +650,7 @@
       "emoji": "🎓",
       "enabled": true,
       "min_relevance": "Mittel",
-      "focus": "Neue Rabattaktionen für Studierende und/oder Lehrende/Dozierende (Hochschule, Uni, Schule, Education-Programme) mit MINDESTENS 50 % Rabatt oder komplett kostenlos – z. B. Software, KI-Tools, Hardware, Bücher, Zeitschriften-/Streaming-Abos, Lernplattformen, Cloud-Credits. Zusätzlich zulässig: allgemeine Gratis-Angebote, die für Studium oder Lehre klar nützlich und hochwertig sind (z. B. kostenlose Vollversionen von Software, KI-Abos, E-Books, Online-Kurse, Produktivitäts-Tools). Der Nutzer lehrt an einer Hochschule in Deutschland; Angebote müssen in Deutschland bzw. online nutzbar sein. Nicht melden: Rabatte unter 50 %, Lebensmittel-/Supermarkt-/Mode-Deals, reine Cashback-Aktionen, Gewinnspiele, allgemeine Schulnachrichten ohne Angebot, bereits bekannte Dauerangebote (z. B. GitHub Student Pack), sofern sich nichts Wesentliches geändert hat. Gib bei 'discount' den Rabatt an (z. B. '100 % / kostenlos', '60 %') und bei 'valid_until' das Ablaufdatum, falls bekannt.",
+      "focus": "Neue Rabatt- und Gratisaktionen für Studierende und/oder Lehrende/Dozierende (Hochschule, Uni, Schule, Education-Programme, UNiDAYS, Campus-Programme) – kostenlos oder deutlich reduziert (v. a. ab ca. 30–50 % Rabatt, bei Hardware/Notebooks/Tablets auch starke Campus-/Studentenrabatte) – z. B. Software, KI-Tools (ChatGPT, Claude, Gemini, Perplexity, Copilot etc.), Hardware, Bücher, Zeitschriften-/Streaming-Abos, Lernplattformen, Zertifizierungen, Cloud-Credits. Zusätzlich ausdrücklich erwünscht: allgemeine Gratis- oder stark reduzierte Angebote, die für Studium, Forschung oder Lehre nützlich sind (z. B. kostenlose Online-Kurse mit Zertifikat wie KI-Campus/Oracle/Anthropic, kostenlose Vollversionen von Software, E-Books, Produktivitäts- und Entwickler-Tools, kostenlose KI-Tiers/Updates). Der Nutzer lehrt an einer Hochschule in Deutschland; Angebote müssen in Deutschland bzw. online nutzbar sein. Nicht melden: Lebensmittel-/Supermarkt-/Mode-/Kosmetik-Deals, reine Cashback-Aktionen, Gewinnspiele, allgemeine Schulnachrichten ohne Angebot. Gib bei 'discount' den Rabatt an (z. B. '100 % / kostenlos', '50 %') und bei 'valid_until' das Ablaufdatum, falls bekannt.",
       "categories": [
         "Rabatt",
         "Gratis",
@@ -659,101 +659,43 @@
       "sources": [
         {
           "type": "rss",
-          "name": "Google News (DE – Studierende/Dozierende)",
-          "url": "https://news.google.com/rss/search?q=(Studentenrabatt+OR+%22f%C3%BCr+Studierende%22+OR+%22f%C3%BCr+Studenten%22+OR+%22f%C3%BCr+Lehrkr%C3%A4fte%22+OR+%22f%C3%BCr+Dozenten%22)+(kostenlos+OR+gratis+OR+Rabatt+OR+Abo+OR+Software+OR+KI)+when:5d&hl=de&gl=DE&ceid=DE:de"
-        },
-        {
-          "type": "rss",
-          "name": "Google News (DE – Software/KI Education)",
-          "url": "https://news.google.com/rss/search?q=(Software+OR+KI+OR+Abo+OR+Cloud+OR+Lizenz+OR+Notebook)+(kostenlos+OR+gratis+OR+Rabatt)+(Studierende+OR+Studenten+OR+Dozenten+OR+Lehrkr%C3%A4fte+OR+Hochschule)+when:7d&hl=de&gl=DE&ceid=DE:de"
-        },
-        {
-          "type": "rss",
-          "name": "Google News (DE – Gratis Vollversionen & E-Books)",
-          "url": "https://news.google.com/rss/search?q=(Vollversion+OR+Software+OR+E-Book+OR+Lizenz+OR+KI-Tool)+(kostenlos+OR+gratis)+when:4d&hl=de&gl=DE&ceid=DE:de",
-          "keywords": [
-            "kostenlos",
-            "gratis",
-            "vollversion",
-            "lizenz",
-            "e-book",
-            "ebook",
-            "software",
-            "ki",
-            "ai",
-            "pro",
-            "plus",
-            "abo"
-          ],
-          "exclude_keywords": [
-            "gewinnspiel",
-            "verlosung",
-            "aldi",
-            "lidl",
-            "rewe",
-            "edeka",
-            "horoskop"
-          ]
-        },
-        {
-          "type": "rss",
-          "name": "Google News (EN – Edu Software & AI Deals)",
-          "url": "https://news.google.com/rss/search?q=(%22free+for+students%22+OR+%22free+for+educators%22+OR+%22free+for+teachers%22+OR+%22student+discount%22+OR+%22education+discount%22)+(software+OR+AI+OR+pro+OR+subscription+OR+cloud+OR+tool)+when:7d&hl=en-US&gl=US&ceid=US:en",
-          "keywords": [
-            "student",
-            "educator",
-            "teacher",
-            "university",
-            "college",
-            "education",
-            "academic",
-            "campus"
-          ],
-          "exclude_keywords": [
-            "promo codes",
-            "coupon codes",
-            "coupons",
-            "outfits",
-            "beauty",
-            "skincare"
-          ]
-        },
-        {
-          "type": "rss",
-          "name": "mydealz (Edu/Software/Freebies via GNews)",
-          "url": "https://news.google.com/rss/search?q=site:mydealz.de+(student+OR+studierende+OR+dozent+OR+lehrer+OR+education+OR+gratis+OR+kostenlos+OR+vollversion+OR+perplexity+OR+gemini+OR+chatgpt+OR+claude+OR+jetbrains+OR+adobe+OR+microsoft+OR+office+OR+ebook)+when:5d&hl=de&gl=DE&ceid=DE:de",
+          "name": "mydealz (Studierende/Edu/Campus via GNews)",
+          "url": "https://news.google.com/rss/search?q=site:mydealz.de+(student+OR+studierende+OR+campus+OR+unidays+OR+dozent+OR+lehrer+OR+education+OR+%22prime+student%22)+when:10d&hl=de&gl=DE&ceid=DE:de",
           "keywords": [
             "student",
             "studier",
+            "campus",
+            "unidays",
             "dozent",
             "lehrer",
             "lehrkr",
             "education",
             "hochschule",
             "universität",
-            "vollversion",
+            "ki-campus",
+            "prime student",
+            "kurs",
+            "zertifikat",
             "software",
             "lizenz",
             "ebook",
             "e-book",
-            "perplexity",
-            "gemini",
             "chatgpt",
             "claude",
+            "gemini",
+            "perplexity",
             "copilot",
             "office",
             "microsoft",
             "adobe",
-            "jetbrains",
-            "udemy",
-            "coursera",
-            "ki-abo",
-            "ki-tool",
-            "lernplattform",
-            "cloud",
+            "apple",
+            "lenovo",
+            "surface",
             "notebook",
             "laptop",
-            "tablet"
+            "tablet",
+            "gratis",
+            "kostenlos"
           ],
           "exclude_keywords": [
             "aldi",
@@ -782,13 +724,162 @@
             "duschgel",
             "klarspüler",
             "topf-set",
+            "pizza",
+            "e-bike"
+          ],
+          "skip_jev": true
+        },
+        {
+          "type": "rss",
+          "name": "mydealz (Gratis Software/KI/Kurse via GNews)",
+          "url": "https://news.google.com/rss/search?q=site:mydealz.de+(vollversion+OR+software+OR+lizenz+OR+ebook+OR+onlinekurs+OR+kurs+OR+zertifikat+OR+udemy+OR+perplexity+OR+gemini+OR+chatgpt+OR+claude+OR+adobe+OR+microsoft+OR+office+OR+oracle+OR+cloud)+(gratis+OR+kostenlos+OR+rabatt)+when:7d&hl=de&gl=DE&ceid=DE:de",
+          "keywords": [
+            "vollversion",
+            "software",
+            "lizenz",
+            "ebook",
+            "e-book",
+            "onlinekurs",
+            "kurs",
+            "zertifikat",
+            "zertifizierung",
+            "udemy",
+            "coursera",
+            "ki-campus",
+            "oracle",
+            "perplexity",
+            "gemini",
+            "chatgpt",
+            "claude",
+            "copilot",
+            "office",
+            "microsoft",
+            "adobe",
+            "jetbrains",
+            "notion",
+            "cloud",
+            "plugin",
+            "ki-abo",
+            "ki-tool",
+            "lernplattform"
+          ],
+          "exclude_keywords": [
+            "aldi",
+            "lidl",
+            "rewe",
+            "edeka",
+            "penny",
+            "netto",
+            "kaufland",
+            "e-center",
+            "bifi",
+            "lieferando",
+            "mcdonald",
+            "burger",
+            "bier",
+            "pils",
+            "pampers",
+            "katzenfutter",
+            "waschmittel",
+            "duschgel",
             "pizza"
+          ],
+          "skip_jev": true
+        },
+        {
+          "type": "rss",
+          "name": "Edu-Portale DE (iamstudent/UNiDAYS/CampusPoint via GNews)",
+          "url": "https://news.google.com/rss/search?q=(site:iamstudent.de+OR+site:unidays.com+OR+site:campuspoint.de+OR+site:edustore.de+OR+site:allmaxx.de)+when:14d&hl=de&gl=DE&ceid=DE:de",
+          "exclude_keywords": [
+            "matcha",
+            "tee",
+            "kaffee",
+            "sneaker",
+            "dessous",
+            "parfüm",
+            "kosmetik",
+            "schmuck",
+            "mode",
+            "jeans",
+            "hotel",
+            "urlaub"
+          ],
+          "skip_jev": true
+        },
+        {
+          "type": "rss",
+          "name": "Google News (DE – Studierende/Dozierende)",
+          "url": "https://news.google.com/rss/search?q=(Studentenrabatt+OR+%22f%C3%BCr+Studierende%22+OR+%22f%C3%BCr+Studenten%22+OR+%22f%C3%BCr+Lehrkr%C3%A4fte%22+OR+%22f%C3%BCr+Dozenten%22)+(kostenlos+OR+gratis+OR+Rabatt+OR+Abo+OR+Software+OR+KI)+when:5d&hl=de&gl=DE&ceid=DE:de",
+          "skip_jev": true
+        },
+        {
+          "type": "rss",
+          "name": "Google News (DE – Software/KI Education)",
+          "url": "https://news.google.com/rss/search?q=(Software+OR+KI+OR+Abo+OR+Cloud+OR+Lizenz+OR+Notebook)+(kostenlos+OR+gratis+OR+Rabatt)+(Studierende+OR+Studenten+OR+Dozenten+OR+Lehrkr%C3%A4fte+OR+Hochschule)+when:7d&hl=de&gl=DE&ceid=DE:de",
+          "skip_jev": true
+        },
+        {
+          "type": "rss",
+          "name": "Google News (DE – Gratis Vollversionen, Kurse & E-Books)",
+          "url": "https://news.google.com/rss/search?q=(Vollversion+OR+Software+OR+E-Book+OR+Onlinekurs+OR+Zertifikat+OR+Lizenz+OR+KI-Tool)+(kostenlos+OR+gratis)+when:5d&hl=de&gl=DE&ceid=DE:de",
+          "keywords": [
+            "kostenlos",
+            "gratis",
+            "vollversion",
+            "lizenz",
+            "e-book",
+            "ebook",
+            "onlinekurs",
+            "kurs",
+            "zertifikat",
+            "software",
+            "ki",
+            "ai",
+            "pro",
+            "plus",
+            "abo"
+          ],
+          "exclude_keywords": [
+            "gewinnspiel",
+            "verlosung",
+            "aldi",
+            "lidl",
+            "rewe",
+            "edeka",
+            "horoskop",
+            "krimi",
+            "romantik",
+            "steam"
           ]
         },
         {
           "type": "rss",
+          "name": "Google News (EN – Tech & AI Student/Educator Deals)",
+          "url": "https://news.google.com/rss/search?q=(%22student+discount%22+OR+%22for+students%22+OR+%22for+educators%22+OR+%22for+teachers%22+OR+%22education+discount%22)+(free+OR+off+OR+discount)+(AI+OR+ChatGPT+OR+Claude+OR+Gemini+OR+Perplexity+OR+Notion+OR+Adobe+OR+Apple+OR+Microsoft+OR+software+OR+course)+when:10d&hl=en-US&gl=US&ceid=US:en",
+          "keywords": [
+            "student",
+            "educator",
+            "teacher",
+            "university",
+            "college",
+            "education",
+            "academic",
+            "campus"
+          ],
+          "exclude_keywords": [
+            "promo codes",
+            "coupon codes",
+            "coupons",
+            "outfits",
+            "beauty",
+            "skincare"
+          ],
+          "skip_jev": true
+        },
+        {
+          "type": "rss",
           "name": "DealDoktor / MeinDeal / Schnäppchenfuchs (GNews)",
-          "url": "https://news.google.com/rss/search?q=(site:dealdoktor.de+OR+site:mein-deal.com+OR+site:schnaeppchenfuchs.com)+(gratis+OR+kostenlos+OR+student+OR+studierende+OR+vollversion+OR+software+OR+ki+OR+abo+OR+ebook)+when:5d&hl=de&gl=DE&ceid=DE:de",
+          "url": "https://news.google.com/rss/search?q=(site:dealdoktor.de+OR+site:mein-deal.com+OR+site:schnaeppchenfuchs.com)+(gratis+OR+kostenlos+OR+student+OR+studierende+OR+vollversion+OR+software+OR+ki+OR+abo+OR+ebook+OR+kurs)+when:7d&hl=de&gl=DE&ceid=DE:de",
           "keywords": [
             "student",
             "studier",
@@ -804,7 +895,12 @@
             "ebook",
             "e-book",
             "hörbuch",
+            "onlinekurs",
+            "kurs",
+            "zertifikat",
             "music unlimited",
+            "audible",
+            "kindle",
             "perplexity",
             "gemini",
             "chatgpt",
@@ -842,8 +938,10 @@
             "katzenfutter",
             "klarspüler",
             "john frieda",
-            "waschmittel"
-          ]
+            "waschmittel",
+            "baumhausbande"
+          ],
+          "skip_jev": true
         },
         {
           "type": "rss",
@@ -860,6 +958,23 @@
             "vollversion",
             "freebie",
             "rabatt",
+            "pro-version"
+          ]
+        },
+        {
+          "type": "rss",
+          "name": "ifun.de (Software, Mac & Deals)",
+          "url": "https://www.ifun.de/feed/",
+          "keywords": [
+            "kostenlos",
+            "gratis",
+            "rabatt",
+            "reduziert",
+            "studierende",
+            "studenten",
+            "education",
+            "vollversion",
+            "aktion",
             "pro-version"
           ]
         },

@@ -1279,9 +1279,10 @@ def notify(
     btn_idx = 0
 
     for r in results:
-        if not r["findings"]:
-            continue
         emoji = r["topic"].get("emoji", "")
+        if not r["findings"]:
+            lines.append(f"\n{esc(emoji)} <b>{esc(r['topic']['name'])}</b> – <i>keine neuen Funde in diesem Lauf</i>")
+            continue
         lines.append(f"\n{esc(emoji)} <b>{esc(r['topic']['name'])}</b>")
         for f in r["findings"][:6]:
             badge = {"Hoch": "🔴", "Mittel": "🟡", "Niedrig": "⚪"}.get(f["relevance"], "•")
